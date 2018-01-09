@@ -1029,27 +1029,28 @@ def group(it, n):
         yield g
         g = tuple(islice(it, n))
 
-def demo_out(emb, testword, iteration):
+def demo_out(emb, iteration, testword=None):
     print()
     print('**** Iteration {} ****'.format(iteration))
 
     print()
-    if testword in emb.docarray.word_index:
-        print('Euclidean distance to test word')
-        print(emb.closest_words(testword, n_words=50,
-                                euclidean=True, mincount=1))
+    if testword is not None:
+        if testword not in emb.docarray.word_index:
+            print('Test word does not appear frequently enough in the corpus')
+        else:
+            print('Euclidean distance to test word')
+            print(emb.closest_words(testword, n_words=50,
+                                    euclidean=True, mincount=1))
 
-        print()
-        print('Cosine similarity to test word')
-        print(emb.closest_words(testword, n_words=50, mincount=1))
+            print()
+            print('Cosine similarity to test word')
+            print(emb.closest_words(testword, n_words=50, mincount=1))
 
-        print()
-        print('Sample vectors')
-        print()
-        print(testword + ':')
-        print(emb.get_vec(testword))
-    else:
-        print('Test word does not appear frequently enough in the corpus')
+            print()
+            print('Sample vectors')
+            print()
+            print(testword + ':')
+            print(emb.get_vec(testword))
 
     print()
     print('Interpretable dimensions?')
@@ -1131,20 +1132,19 @@ def demo_out(emb, testword, iteration):
 
 def main():
     textdir = sys.argv[1]
-    testword = sys.argv[2]
 
     textfiles = sorted(os.path.join(textdir, f) for f in os.listdir(textdir))
     alldocs = (sent
                for fn in textfiles
-               for sent in load(fn, window_size=15, annotate=True))
-    alldocs = islice(alldocs, 1000000)
+               for sent in load(fn, window_size=15, annotate=False))
+    # alldocs = islice(alldocs, 1000000)
     alldocs = DocArray(alldocs)
-    emb = Embedding(alldocs, multiplier=20)
+    emb = Embedding(alldocs, multiplier=40)
 
     n_iters = 1
     for i in range(n_iters):
         emb.train_multi(with_jacobian=True)
-        demo_out(emb, testword, i)
+        demo_out(emb, i)
 
         if i < n_iters - 1:
             emb.step_embedding()
@@ -1155,10 +1155,10 @@ def main():
 
 
 if __name__ == '__main__':
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
         print("No arguments supplied, so running tests.")
         print("Vector training usage:")
-        print("    python talediff.py [plaintext_directory] [test_word]")
+        print("    python typevectors.py [plaintext_directory]")
         print()
         test_hessians()
     else:
