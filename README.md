@@ -41,7 +41,7 @@ would make a good tale function `T`?
 ### Word Embedding Vectors Are Type-Level Hessian Matrices
 
 This project takes inspration from McBride 
-([2001](http://strictlypositive.org/diff.pdf) and Abbot et. al. 
+([2001](http://strictlypositive.org/diff.pdf)) and Abbot et. al. 
 ([2003]()http://strictlypositive.org/derivcont.pdf), 
 who show that algebraic data types are differentiable, and that all the
 familiar differential operators from calculus, including the gradient and
