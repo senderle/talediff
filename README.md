@@ -6,7 +6,7 @@ This project introduces a new way to reason formally about word embedding
 models. Abstractly, suppose for a family of languages `L` we have a vector
 space `V` of language features, and a scalar function `T` defined on `V` 
 that describes something like the "expressive power" of `L` -- called the 
-tale function, "tale" being a word that has long signified both a *count*
+tale function, "tale" being a word that has long denoted both a *count*
 and an *account*. We are interested in the effect of "extending" a member of 
 `L` along some dimension `d` of `V`. Concretely, suppose we take a member 
 of `L`, `l_1`, and add new words, creating `l_2`. These two languages have 
@@ -42,7 +42,7 @@ would make a good tale function `T`?
 
 This project takes inspration from McBride 
 ([2001](http://strictlypositive.org/diff.pdf)) and Abbot et. al. 
-([2003]()http://strictlypositive.org/derivcont.pdf), 
+([2003](http://strictlypositive.org/derivcont.pdf)), 
 who show that algebraic data types are differentiable, and that all the
 familiar differential operators from calculus, including the gradient and
 Hessian operators, follow essentially identical rules. By formulating
@@ -57,7 +57,7 @@ corpus. First, define a language as the sum type over all possible
 sentences in the language. Define a sentence as the product type over
 the words that constitute it. And define a word type as a singleton
 type. In other words, define a language as a large, high-dimensional
-polynomial over singleton word types.
+type-level polynomial over singleton word types.
 
 The second derivative of a sentence type defined in the above way is a 
 Hessian matrix with zeros for all word pairs not in the sentece at all
