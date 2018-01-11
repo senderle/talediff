@@ -6,8 +6,8 @@ This project introduces a new way to reason formally about word embedding
 models. Abstractly, suppose for a family of languages `L` we have a vector
 space `V` of language features, and a scalar function `T` defined on `V` 
 that describes something like the "expressive power" of `L` -- called the 
-tale function, "tale" being a word that has long signified both *counts*
-and *accounts*. We are interested in the effect of "extending" a member of 
+tale function, "tale" being a word that has long signified both a *count*
+and an *account*. We are interested in the effect of "extending" a member of 
 `L` along some dimension `d` of `V`. Concretely, suppose we take a member 
 of `L`, `l_1`, and add new words, creating `l_2`. These two languages have 
 associated feature vectors in `V` that are equal, except along the dimesion 
