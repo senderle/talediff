@@ -79,7 +79,7 @@ the sentences.
 
 As Goldberg and Levy ([2014](https://arxiv.org/abs/1402.3722)) and 
 others have shown, many standard word embedding models are essentially
-just factorizaitons of this matrix using various weighting and
+just factorizations of this matrix using various weighting and
 normalization schemes. Goldberg and Levy ask "Why does this produce good
 word representations?" The above construction provides a new answer to
 that question, at least if we assume that "good" is an underspecified 
