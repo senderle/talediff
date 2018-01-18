@@ -1,5 +1,6 @@
 import numpy
 import multiprocessing
+import psutil
 from collections import Counter
 from collections import abc
 from itertools import islice
@@ -303,18 +304,21 @@ class DocArray(abc.Sequence):
 # eigenvector, though. One way to avoid that is to
 # take the newly calculated embedding vectors and
 # sparsify them so that they "look like" the original
-# binary projection vectors. But in the end, the
-# most effective approach seems to be to perform
-# SVD over a small set of random projection vectors.
-# By doing so, we get nice, dense vectors that
-# appraoch the performance of GloVe vectors on
-# the hutter8 dataset.
+# binary projection vectors.
+
+# But in the end, the most effective approach might
+# be to be to perform SVD over a small set of random
+# projection vectors. I was doing this and it was
+# working! But then it stopped working... and I
+# cannot for the life of me figure out what I
+# changed.
 
 class Embedding(object):
-    def __init__(self, docarray=None, multiplier=10, sparsifier=0):
+    def __init__(self, docarray=None, multiplier=10, sparsifier=1):
         self.docarray = None
         self.multiplier = multiplier
         self.sparsifier = sparsifier
+        self._erase_on_reset = False
 
         if docarray is None:
             self.append_docarray(DocArray())
@@ -338,7 +342,11 @@ class Embedding(object):
 
     def step_embedding(self):
         self.hash_iter_vectors = self._sparsify_embedding()
-        self.embed_vectors = numpy.zeros(self.hash_iter_vectors.shape)
+        self._erase_on_reset = True
+
+    def _reset_embedding(self):
+        if self._erase_on_reset:
+            self.embed_vectors = numpy.zeros(self.hash_iter_vectors.shape)
 
     def get_vec(self, word):
         return self.embed_vectors[self.docarray.word_index[word]]
@@ -400,25 +408,42 @@ class Embedding(object):
         # worked OK, not great. The probabilistic approach implemented
         # in `resample_vectors` was better, but much slower.
 
-        # return resample_vectors_median(self.embed_vectors)
         return resample_vectors(self.embed_vectors)
 
     def _eigen_embedding(self):
-        ev = self.embed_vectors.copy()
+        ev = self.embed_vectors
         ev -= ev.mean(axis=0)
         U, s, V = numpy.linalg.svd(ev.T @ ev)
         result = ev @ U.T
+        print('  -- SVD --')
+        print('Shape of embedding vectors:')
+        print('{} rows, {} columns'.format(*ev.shape))
+        print('First 10 values of s:')
+        print(s[:10])
+        print('Last 10 values of s:')
+        print(s[-10:])
+        print('Shape of output vectors:')
+        print('{} rows, {} columns'.format(*result.shape))
         return result
 
     def train(self):
+        self._reset_embedding()
         embed = train_chunk(self.docarray, self.hash_iter_vectors)
         self.embed_vectors += embed
 
     def train_sp(self):
+        self._reset_embedding()
         embed = train_chunk_cy(self.docarray, self.hash_iter_vectors)
         self.embed_vectors += embed
 
-    def _chunkparams(self, min_chunksize, max_chunksize):
+    def _chunkparams(self, embed_shape):
+        # Eventually, try to guess how much memory is available and try
+        # to balance chunksize and n_procs against avialable memory.
+        # psutil.virtual_memory().available
+
+        n_words, n_dims = embed_shape
+        min_chunksize = 1000
+        max_chunksize = 2 ** 26 // n_dims
         n_docs = len(self.docarray)
         n_procs = multiprocessing.cpu_count()
         chunksize = n_docs // n_procs + 1
@@ -433,11 +458,11 @@ class Embedding(object):
             return tuple(islice(all_chunks, 0, n_procs))
         return iter(chunkslicer, ())
 
-    def train_multi(self, min_chunksize=1000,
-                    max_chunksize=50000, with_jacobian=False):
+    def train_multi(self, with_jacobian=False):
+        self._reset_embedding()
         hash_vectors = self.hash_iter_vectors
         n_docs = len(self.docarray)
-        chunksize, n_procs = self._chunkparams(min_chunksize, max_chunksize)
+        chunksize, n_procs = self._chunkparams(hash_vectors.shape)
 
         # For reasons I do not fully understand, multiprocessing doesn't
         # schedule large chunks very well; we wind up using just two
@@ -451,7 +476,7 @@ class Embedding(object):
         all_chunks = ((self.docarray[i:i + chunksize], hash_vectors)
                       for i in range(0, len(self.docarray), chunksize))
         chunk_ct = 0
-        print("starting multiprocessing...")
+        print("Starting multiprocessing:")
         print("    {} processes".format(n_procs))
         print("    {} tasks per chunk".format(chunksize))
         print("    ~{} chunks".format(n_docs // chunksize + 1))
@@ -469,16 +494,18 @@ class Embedding(object):
             with multiprocessing.Pool(processes=n_procs) as pool:
                 for result in pool.imap(train, chunks):
                     if with_jacobian:
-                        ev_r, ix_r, jac_r = result
+                        ev_r, jac_r, ix_r = result
                         self.embed_vectors[ix_r] += ev_r
-                        jac += jac_r
+                        jac[ix_r] += jac_r
                     else:
-                        self.embed_vectors += result
+                        ev_r, ix_r = result
+                        self.embed_vectors[ix_r] += ev_r
         if with_jacobian:
             jac[jac == 0] = 1
             self.embed_vectors /= jac[:, None]
 
     def train_simple(self):
+        self._reset_embedding()
         hash_vectors = self.hash_iter_vectors
         for indices, counts, totals, log_totals in self.docarray:
             # Documents with only one word do us no good.
@@ -553,7 +580,7 @@ class Embedding(object):
             for r in rows:
                 op.write(r)
 
-    def _train_test_chunk_sp(self):
+    def train_test_chunk_sp(self):
         """
         As of 2017-10-22, this passes consistently.
         """
@@ -565,7 +592,9 @@ class Embedding(object):
         error_records = []
         for ch_ix, chunk in enumerate(chunks):
             r1 = train_chunk_star(chunk)
+            r1 = r1[r1.sum(axis=1) > 0]
             r2 = train_chunk_star_sp(chunk)
+            r2, r2ix = r2
             try:
                 assert numpy.allclose(r1, r2)
             except AssertionError:
@@ -585,13 +614,15 @@ class Embedding(object):
                 print("Max bad error:")
                 print(bad_errors.max())
                 print()
-                if bad_error_ratio > 0.001:
+                if bad_error_ratio > 1e-5:
                     error_records.append((ch_ix, bad_error_ratio))
 
-            self.embed_vectors += r2
+            self.embed_vectors[r2ix] += r2
 
         if error_records:
             raise RuntimeError("_train_test_chunk_sp: test failed")
+        else:
+            print('All chunkwise training tests passed.')
 
 # ###########################
 # #### Utility Functions ####
@@ -697,7 +728,6 @@ def euclidean_dist_to(word, vec_dict):
         return euclidean_dist(vec_dict[w], vec)
     return dist
 
-
 def train_chunk_star(docarray_hash_vectors):
     docarray, hash_vectors = docarray_hash_vectors
     return train_chunk(docarray, hash_vectors)
@@ -749,6 +779,14 @@ def embed_hess(dc_vec, wc_vec, wc_vec_raw, hv):
     hess **= 1 / len_doc
     hess /= len_doc
     hess /= (wc_vec_raw[:, None] + 1)
+
+    # This corresponds to the tests described as
+    # "a bit sloppy" in sparsehess.pyx. There's a
+    # chance these have a significant negative
+    # effect on dimension reduction; more testing
+    # is needed to verify that this isn't an
+    # issue.
+    hess[~numpy.isfinite(hess)] = 0
 
     # Project hessian into hashed vector space...
     return hess @ hv

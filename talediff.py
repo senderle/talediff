@@ -1,9 +1,10 @@
-import sys
 import os
 import re
 import string
 import argparse
+import subprocess
 from itertools import islice
+
 from docembed import DocArray
 from docembed import Embedding
 from docembed import test_hessians
@@ -192,9 +193,13 @@ def parse_args():
         '-w',
         '--window-size',
         type=int,
-        default=15,
+        default=30,
         help='The width of the context window (for input that cannot be '
-        'parsed into sentences).'
+        'parsed into sentences). This matches the default GloVe test '
+        'settings. (The GloVe test settings are misleading; they '
+        'use 15 as the window size, but they consider 15-word windows '
+        'preceding *and* following each word which doubles the effective '
+        'window size.'
     )
     parser.add_argument(
         '-a',
@@ -210,10 +215,22 @@ def parse_args():
         '--hash-vector-multiplier',
         type=int,
         default=10,
-        help='A parameter that determines the length of the output vectors. '
-        'We generate random binary projection vectors using the hash of the '
-        'given word; hashes are 64-bits long, so a multiplier of 10 gives a '
-        '640-dimension vector.'
+        help='A parameter that helps determine the length of the hash '
+        'vectors, along with --hash-vector-sparsifier, below. We generate '
+        'random binary projection vectors using the hash of the given '
+        'word; hashes are 64-bits long, so if the sparsifier is 0, then '
+        'a multiplier of 10 gives a 640-dimension vector. The total number '
+        'of dimensions is equal to 64 * multiplier * sparsifier.'
+    )
+    parser.add_argument(
+        '-s',
+        '--hash-vector-sparsifier',
+        type=int,
+        default=2,
+        help='A parameter that "stretches" the hash vectors by padding them '
+        'with evenly spaced zeros. Some degree of sparsity ensures that '
+        'the final embedding vectors have better interpretability. See '
+        '--hash-vector-multiplier as well.'
     )
     parser.add_argument(
         '-n',
@@ -257,14 +274,42 @@ def parse_args():
         'is performed.'
     )
     parser.add_argument(
-        '-H',
         '--test-hessian',
         action='store_true',
         default=False,
         help='Rather than training a model, perform a battery of tests to the '
         'hessian-generating code.'
     )
-    return parser.parse_args()
+    parser.add_argument(
+        '--test-train-chunk',
+        action='store_true',
+        default=False,
+        help='Rather than training a model, perform a battery of tests to the '
+        'chunkwise training code.'
+    )
+    parser.add_argument(
+        '-d',
+        '--demo',
+        action='store_true',
+        default=False,
+        help='Display demo output after every iteration.'
+    )
+    parser.add_argument(
+        '-e',
+        '--evaluate',
+        action='store_true',
+        default=False,
+        help='Execute the GloVe evaluation script on saved vectors.'
+    )
+
+    args = parser.parse_args()
+    if not args.demo and not args.evaluate:
+        args.demo = True
+
+    if args.test_train_chunk:
+        args.number_of_windows = 10000
+
+    return args
 
 def main(args):
     textdir = args.text_directory
@@ -279,18 +324,25 @@ def main(args):
         alldocs = islice(alldocs, args.number_of_windows)
 
     alldocs = DocArray(alldocs)
-    emb = Embedding(alldocs, multiplier=args.hash_vector_multiplier)
+    emb = Embedding(alldocs,
+                    multiplier=args.hash_vector_multiplier,
+                    sparsifier=args.hash_vector_sparsifier)
 
+    if args.test_train_chunk:
+        emb.train_test_chunk_sp()
+    else:
+        main_train(emb, args)
+
+def main_train(emb, args):
     # possibly my dimension reduction woes are arising because we
     # must complete at least two iterations for the SVD to produce
     # useful results...
     n_iters = args.number_of_iterations
     for i in range(n_iters):
+        print('Iteration {}...'.format(i))
         emb.train_multi(with_jacobian=args.with_jacobian)
-        demo_out(emb, i)
-
-        if i < n_iters - 1:
-            emb.step_embedding()
+        if args.demo:
+            demo_out(emb, i)
 
     truncate = args.save_truncated_vectors
     truncate = truncate if truncate > 0 else None
@@ -299,6 +351,8 @@ def main(args):
                      truncate=truncate,
                      include_annotated=False)
     emb.save_vocab('vocab.txt', mincount=args.save_mincount)
+    if args.evaluate:
+        subprocess.run(['python', 'eval/python/evaluate.py'])
 
 
 if __name__ == '__main__':

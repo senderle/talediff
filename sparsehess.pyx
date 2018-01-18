@@ -343,12 +343,15 @@ cdef void cy_embed_hess(
             hess_norm = hess[i, j] ** len_doc_recip
             hess_norm *= len_doc_recip
             hess_norm /= wc_vec_raw[i] + 1
+
+            # A bit sloppy: assume nan == 0
+            if isnan(hess_norm) or isinf(hess_norm):
+                continue
+
             for k in range(embed_size):
                 w_i = index_vec[i]
                 w_j = index_vec[j]
-                result = embed[w_i, k] + hess_norm * hash_vecs[w_j, k]
-                if not isnan(result):
-                    embed[w_i, k] = result
+                embed[w_i, k] = embed[w_i, k] + hess_norm * hash_vecs[w_j, k]
 
 @cython.boundscheck(False)
 @cython.cdivision(True)
@@ -383,7 +386,9 @@ def train_chunk_cy(docarray, hash_vectors):
 
     cy_train_chunk_combined(ends, indices, counts, totals,
                             log_totals, embed_vectors, hash_vectors)
-    return embed_vectors
+
+    nonzero_ix = embed_vectors.sum(axis=1) > 0
+    return embed_vectors[nonzero_ix], nonzero_ix.nonzero()
 
 def train_chunk_jacobian_cy(docarray, hash_vectors):
     ends, indices, counts, totals, log_totals = docarray.features()
@@ -392,8 +397,9 @@ def train_chunk_jacobian_cy(docarray, hash_vectors):
 
     cy_train_chunk_jacobian(ends, indices, counts, totals,
                             log_totals, jacobian, embed_vectors, hash_vectors)
+
     nonzero_ix = embed_vectors.sum(axis=1) > 0
-    return embed_vectors[nonzero_ix], nonzero_ix.nonzero(), jacobian
+    return embed_vectors[nonzero_ix], jacobian[nonzero_ix], nonzero_ix.nonzero()
 
 # This can be regarded as a middle-way reference implementation
 # that uses pure cython objects for inner loops (via the
@@ -424,7 +430,9 @@ def train_chunk_py(docarray, hash_vectors):
 
         cy_embed_hess(counts, log_totals, totals, indices,
                       hess_buffer, embed_vectors, hash_vectors)
-    return embed_vectors
+
+    nonzero_ix = embed_vectors.sum(axis=1) > 0
+    return embed_vectors[nonzero_ix], nonzero_ix.nonzero()
 
 def block_logspace_hessian(pow_vector, x_vector):
     cdef long size = x_vector.shape[0]
