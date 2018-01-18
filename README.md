@@ -14,8 +14,8 @@ associated feature vectors in `V` that are equal, except along the dimesion
 `d`, and so `l_2 = l_1 + delta_d`.
 
 Now let us ask: what is the difference between these two languages in terms
-of "expressive power"? The fundamental assumtion of this model is that 
-the change in expressive power along the changed dimension tells us 
+of "expressive power"? The fundamental assumption of this model is that 
+the change in expressive power along the changed dimensionr tells us 
 something important about the dimension itself and its relationship to
 the language. This amounts to differentiation:
 
