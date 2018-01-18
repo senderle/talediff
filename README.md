@@ -15,7 +15,7 @@ associated feature vectors in `V` that are equal, except along the dimesion
 
 Now let us ask: what is the difference between these two languages in terms
 of "expressive power"? The fundamental assumption of this model is that 
-the change in expressive power along the changed dimensionr tells us 
+the change in expressive power along the changed dimension tells us 
 something important about the dimension itself and its relationship to
 the language. This amounts to differentiation:
 
