@@ -3,7 +3,7 @@ A prototype word embedding model based on type-level differential operators.
 
 # Acknowledgements
 
-This repository contains code from the [Glove](https://github.com/stanfordnlp/GloVe) --
+This repository contains code from [Glove](https://github.com/stanfordnlp/GloVe) --
 the contents of `eval` are essentially copied directly.
 
 # Concept
