@@ -1,6 +1,11 @@
 # talediff
 A prototype word embedding model based on type-level differential operators.
 
+# Acknowledgements
+
+This repository contains code from the [Glove](https://github.com/stanfordnlp/GloVe) --
+the contents of `eval` are essentially copied directly.
+
 # Concept
 This project introduces a new way to reason formally about word embedding
 models. Abstractly, suppose for a family of languages `L` we have a vector
