@@ -190,6 +190,20 @@ def parse_args():
         help='Calculate the jacobian for use as a normalizing factor.'
     )
     parser.add_argument(
+        '-r',
+        '--arithmetic-norm',
+        action='store_true',
+        default=False,
+        help='Use arithmetic normalization.'
+    )
+    parser.add_argument(
+        '-g',
+        '--geometric-norm',
+        action='store_true',
+        default=False,
+        help='Use geometric normalization.'
+    )
+    parser.add_argument(
         '-w',
         '--window-size',
         type=int,
@@ -214,7 +228,7 @@ def parse_args():
         '-m',
         '--hash-vector-multiplier',
         type=int,
-        default=10,
+        default=20,
         help='A parameter that helps determine the length of the hash '
         'vectors, along with --hash-vector-sparsifier, below. We generate '
         'random binary projection vectors using the hash of the given '
@@ -226,11 +240,13 @@ def parse_args():
         '-s',
         '--hash-vector-sparsifier',
         type=int,
-        default=2,
+        default=-1,
         help='A parameter that "stretches" the hash vectors by padding them '
         'with evenly spaced zeros. Some degree of sparsity ensures that '
         'the final embedding vectors have better interpretability. See '
-        '--hash-vector-multiplier as well.'
+        '--hash-vector-multiplier as well. A value less than zero indicates '
+        'dense vectors of positive and negative values, instead of ones and '
+        'zeros.'
     )
     parser.add_argument(
         '-n',
@@ -244,12 +260,12 @@ def parse_args():
         '-i',
         '--number-of-iterations',
         type=int,
-        default=2,
+        default=1,
         help='The number of times to resample the resulting vectors and '
         'retrain the embeddings. The first iteration produces purely random '
         'projections of the hessian; later iterations produce more organized '
         'projections. More than three or four iterations appear to produce '
-        'overfitting behavior. Defaults to 2.'
+        'overfitting behavior.'
     )
     parser.add_argument(
         '-c',
@@ -264,14 +280,10 @@ def parse_args():
     parser.add_argument(
         '-t',
         '--save-truncated-vectors',
-        nargs='?',
         type=int,
         default=0,
-        const=50,
         help='Perform dimension reduction using SVD and preserve this many '
-        'dimensions. If only the flag is passed, the number of dimensions '
-        'defaults to 50. If the flag is not passed, no dimension reduction '
-        'is performed.'
+        'dimensions. By default, no dimension reduction is performed.'
     )
     parser.add_argument(
         '--test-hessian',
@@ -301,6 +313,17 @@ def parse_args():
         default=False,
         help='Execute the GloVe evaluation script on saved vectors.'
     )
+    parser.add_argument(
+        '-v',
+        '--eval-mode',
+        default='1',
+        choices=['1', 'log', '1log', 'scalefree', '1scalefree'],
+        type=str,
+        help='Mode for selecting a point in expressivity space for evaluating '
+        'the jacobian and hessian. Defaults to the one-point (1, 1, 1, ...). '
+        'Any truthy argument activates log-total mode, which uses the log of '
+        'each word\'s frequency in the corpus.'
+    )
 
     args = parser.parse_args()
     if not args.demo and not args.evaluate:
@@ -323,10 +346,12 @@ def main(args):
     if args.number_of_windows > 0:
         alldocs = islice(alldocs, args.number_of_windows)
 
-    alldocs = DocArray(alldocs)
+    alldocs = DocArray(alldocs, eval_mode=args.eval_mode)
     emb = Embedding(alldocs,
                     multiplier=args.hash_vector_multiplier,
                     sparsifier=args.hash_vector_sparsifier)
+
+    print('Creating a {}-dimension base embedding.'.format(emb.n_bits))
 
     if args.test_train_chunk:
         emb.train_test_chunk_sp()
@@ -340,7 +365,9 @@ def main_train(emb, args):
     n_iters = args.number_of_iterations
     for i in range(n_iters):
         print('Iteration {}...'.format(i))
-        emb.train_multi(with_jacobian=args.with_jacobian)
+        emb.train_multi(with_jacobian=args.with_jacobian,
+                        arithmetic_norm=args.arithmetic_norm,
+                        geometric_norm=args.geometric_norm)
         if args.demo:
             demo_out(emb, i)
 

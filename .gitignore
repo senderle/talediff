@@ -2,6 +2,7 @@
 
 vectors.txt
 vocab.txt
+sparsehess.c
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

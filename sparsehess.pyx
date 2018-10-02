@@ -25,7 +25,7 @@ cdef void cy_train_chunk_combined(
         double[:] totals,
         double[:] log_totals,
         double[:, :] embed_vecs,
-        unsigned char[:, :] hash_vecs) nogil:
+        signed char[:, :] hash_vecs) nogil:
 
     # Memorably named temp variables.
     cdef double len_doc_recip = 0
@@ -176,7 +176,7 @@ cdef void cy_train_chunk_jacobian(
         double[:] log_totals,
         double[:] jacobian,
         double[:, :] embed_vecs,
-        unsigned char[:, :] hash_vecs) nogil:
+        signed char[:, :] hash_vecs) nogil:
 
     # Memorably named temp variables.
     cdef double len_doc_recip = 0
@@ -265,14 +265,104 @@ cdef void cy_train_chunk_jacobian(
 
                 # Geometric mean w.r.t. doc length and arithmetic
                 # mean w.r.t total word frequency.
-                hess_i_j = (hess_i_j ** len_doc_recip /
-                            (totals_i))
+                # hess_i_j = (hess_i_j ** len_doc_recip /
+                #             (totals_i))
+                # hess_i_j = hess_i_j / totals_i
+                hess_i_j = hess_i_j ** len_doc_recip
 
                 # A bit sloppy: assume nan == 0
                 if isnan(hess_i_j) or isinf(hess_i_j):
                     continue
 
                 # Sparse dot product over random hash vectors.
+                w_j = indices[start + j]
+                for k in range(embed_size):
+                    embed_dot = (embed_vecs[w_i, k] +
+                                 hess_i_j *
+                                 hash_vecs[w_j, k])
+                    embed_vecs[w_i, k] = embed_dot
+
+        start = end
+
+@cython.boundscheck(False)
+@cython.cdivision(True)
+@cython.wraparound(False)
+cdef void cy_train_chunk_configurable(
+        long[:] ends,
+        long[:] indices,
+        double[:] counts,
+        double[:] totals,
+        double[:] log_totals,
+        double[:] jacobian,
+        double[:, :] embed_vecs,
+        signed char[:, :] hash_vecs,
+        int arithmetic_norm,
+        int geometric_norm) nogil:
+
+    # Memorably named temp variables.
+    cdef double len_doc_recip = 0
+    cdef double poly_pow = 0
+    cdef double jac_i = 0
+    cdef double counts_i = 0
+    cdef double totals_i = 0
+    cdef double hess_i_j = 0
+    cdef double embed_dot = 0
+
+    # Boundaries and index variables.
+    cdef long n_docs = ends.shape[0]
+    cdef long start = 0
+    cdef long end = 0
+    cdef long hess_size = 0
+    cdef long embed_size = hash_vecs.shape[1]
+    cdef long i, j, k, w_i, w_j, doc_ix
+
+    # This performs almost the same operation as the above function
+    # `cy_train_chunk_jacobian`, but provides several configurable
+    # behaviors. Notes are omitted entirely; for documentation, see
+    # comments to above functions.
+
+    for doc_ix in range(n_docs):
+        end = ends[doc_ix]
+        hess_size = end - start
+
+        len_doc_recip = 0
+        for i in range(hess_size):
+            len_doc_recip += counts[start + i]
+
+        if len_doc_recip < 2:
+            continue
+
+        len_doc_recip = 1 / len_doc_recip
+
+        poly_pow = 0
+        for i in range(hess_size):
+            poly_pow = poly_pow + log(log_totals[start + i]) * counts[start + i]
+
+        for i in range(hess_size):
+            w_i = indices[start + i]
+            counts_i = counts[start + i]
+            totals_i = totals[start + i]
+
+            jac_i = (poly_pow +
+                     log(counts_i) -
+                     log(log_totals[start + i]))
+
+            jacobian[w_i] = (jacobian[w_i] +
+                             exp(jac_i * len_doc_recip))
+            for j in range(hess_size):
+                hess_i_j = exp(jac_i +
+                               log(counts[start + j]) -
+                               log(log_totals[start + j]))
+
+                if i == j:
+                    hess_i_j *= (counts_i - 1) / counts_i
+                if geometric_norm > 0:
+                    hess_i_j = hess_i_j ** len_doc_recip
+                if arithmetic_norm > 0:
+                    hess_i_j = hess_i_j / totals_i
+                if isnan(hess_i_j) or isinf(hess_i_j):
+                    continue
+
                 w_j = indices[start + j]
                 for k in range(embed_size):
                     embed_dot = (embed_vecs[w_i, k] +
@@ -293,7 +383,7 @@ cdef void cy_train_chunk(
         double[:] log_totals,
         double[:, :] hess_buffer,
         double[:, :] embed_vecs,
-        unsigned char[:, :] hash_vecs) nogil:
+        signed char[:, :] hash_vecs) nogil:
     cdef long start = 0
     cdef long end = 0
     cdef long doc_ix = 0
@@ -321,7 +411,7 @@ cdef void cy_embed_hess(
         long[:] index_vec,
         double[:, :] hess,
         double[:, :] embed,
-        unsigned char[:, :] hash_vecs) nogil:
+        signed char[:, :] hash_vecs) nogil:
     cdef double len_doc_recip = 0
     cdef long hess_size = dc_vec.shape[0]
     cdef long embed_size = hash_vecs.shape[1]
@@ -400,6 +490,24 @@ def train_chunk_jacobian_cy(docarray, hash_vectors):
 
     nonzero_ix = embed_vectors.sum(axis=1) > 0
     return embed_vectors[nonzero_ix], jacobian[nonzero_ix], nonzero_ix.nonzero()
+
+def train_chunk_configurable_cy(docarray, hash_vectors,
+                                arithmetic_norm=False,
+                                geometric_norm=False):
+    ends, indices, counts, totals, log_totals = docarray.features()
+    embed_vectors = numpy.zeros(hash_vectors.shape, dtype=numpy.float64)
+    jacobian = numpy.zeros(hash_vectors.shape[0], dtype=numpy.float64)
+
+    arithmetic_norm = int(bool(arithmetic_norm))
+    geometric_norm = int(bool(geometric_norm))
+    cy_train_chunk_configurable(ends, indices, counts, totals, log_totals,
+                                jacobian, embed_vectors, hash_vectors,
+                                arithmetic_norm, geometric_norm)
+
+    nonzero_ix = embed_vectors.sum(axis=1) > 0
+    return (embed_vectors[nonzero_ix],
+            jacobian[nonzero_ix],
+            nonzero_ix.nonzero())
 
 # This can be regarded as a middle-way reference implementation
 # that uses pure cython objects for inner loops (via the

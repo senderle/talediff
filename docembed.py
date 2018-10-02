@@ -8,6 +8,7 @@ from sparsehess import block_logspace_hessian as block_logspace_hessian_sp
 from sparsehess import train_chunk_py
 from sparsehess import train_chunk_cy
 from sparsehess import train_chunk_jacobian_cy
+from sparsehess import train_chunk_configurable_cy
 
 class ExtendWrap(abc.Sequence):
     def __init__(self, array):
@@ -47,7 +48,9 @@ class ExtendWrap(abc.Sequence):
         self._len = new_len
 
 class DocArray(abc.Sequence):
-    def __init__(self, documents=None):
+    def __init__(self, documents=None, eval_mode=''):
+        self.eval_mode = eval_mode
+
         if isinstance(documents, DocArray):
             self.words = list(documents.words)
             self.word_index = dict(documents.word_index)
@@ -170,11 +173,26 @@ class DocArray(abc.Sequence):
             document_counts = [c.items() for c in document_counters]
 
             total = Counter(wix[w] for doc in documents for w in doc)
+            all_total = sum(total.values())
+            mean_word_freq = all_total / len(total)
             for ix, ct in total.items():
                 self._word_count[ix] += ct
-                self._log_word_count[ix] = \
-                    numpy.log10(self._word_count[ix]) + 1
-                # self._log_word_count[ix] = 1
+                if self.eval_mode == 'log':
+                    self._log_word_count[ix] = \
+                        numpy.log10(self._word_count[ix]) + 1
+                elif self.eval_mode == '1log':
+                    self._log_word_count[ix] = \
+                        1 / (numpy.log10(self._word_count[ix]) + 1)
+                elif self.eval_mode == 'scalefree':
+                    self._log_word_count[ix] = \
+                        numpy.exp(self._word_count[ix] / all_total -
+                                  mean_word_freq / all_total)
+                elif self.eval_mode == '1scalefree':
+                    self._log_word_count[ix] = \
+                        numpy.exp(mean_word_freq / all_total -
+                                  self._word_count[ix] / all_total)
+                elif self.eval_mode in ('', '1', 'one'):
+                    self._log_word_count[ix] = 1
 
             indices, counts = zip(*[i_c
                                     for doc in document_counts
@@ -314,7 +332,7 @@ class DocArray(abc.Sequence):
 # changed.
 
 class Embedding(object):
-    def __init__(self, docarray=None, multiplier=10, sparsifier=1):
+    def __init__(self, docarray=None, multiplier=10, sparsifier=-1):
         self.docarray = None
         self.multiplier = multiplier
         self.sparsifier = sparsifier
@@ -327,7 +345,8 @@ class Embedding(object):
 
     @property
     def n_bits(self):
-        return 64 * self.multiplier * 2 ** self.sparsifier
+        sp = max(self.sparsifier, 0)
+        return 64 * self.multiplier * 2 ** sp
 
     def append_docarray(self, docarray):
         if self.docarray:
@@ -443,7 +462,7 @@ class Embedding(object):
 
         n_words, n_dims = embed_shape
         min_chunksize = 1000
-        max_chunksize = 2 ** 26 // n_dims
+        max_chunksize = 2 ** 25 // n_dims
         n_docs = len(self.docarray)
         n_procs = multiprocessing.cpu_count()
         chunksize = n_docs // n_procs + 1
@@ -458,7 +477,10 @@ class Embedding(object):
             return tuple(islice(all_chunks, 0, n_procs))
         return iter(chunkslicer, ())
 
-    def train_multi(self, with_jacobian=False):
+    def train_multi(self,
+                    with_jacobian=False,
+                    arithmetic_norm=False,
+                    geometric_norm=False):
         self._reset_embedding()
         hash_vectors = self.hash_iter_vectors
         n_docs = len(self.docarray)
@@ -481,11 +503,15 @@ class Embedding(object):
         print("    {} tasks per chunk".format(chunksize))
         print("    ~{} chunks".format(n_docs // chunksize + 1))
 
-        if with_jacobian:
-            jac = numpy.zeros(self.embed_vectors.shape[0], dtype=numpy.float64)
-            train = train_chunk_star_jacobian
+        jac = numpy.zeros(self.embed_vectors.shape[0], dtype=numpy.float64)
+        if arithmetic_norm and geometric_norm:
+            train = train_chunk_star_jac_arith_geom
+        elif geometric_norm:
+            train = train_chunk_star_jac_geom
+        elif arithmetic_norm:
+            train = train_chunk_star_jac_arith
         else:
-            train = train_chunk_star_sp
+            train = train_chunk_star_jac_unnormed
 
         for chunks in self._chunkslicer(all_chunks, n_procs):
             print('processing chunks {}-{}'.format(chunk_ct,
@@ -493,13 +519,10 @@ class Embedding(object):
             chunk_ct += len(chunks)
             with multiprocessing.Pool(processes=n_procs) as pool:
                 for result in pool.imap(train, chunks):
-                    if with_jacobian:
-                        ev_r, jac_r, ix_r = result
-                        self.embed_vectors[ix_r] += ev_r
-                        jac[ix_r] += jac_r
-                    else:
-                        ev_r, ix_r = result
-                        self.embed_vectors[ix_r] += ev_r
+                    ev_r, jac_r, ix_r = result
+                    self.embed_vectors[ix_r] += ev_r
+                    jac[ix_r] += jac_r
+
         if with_jacobian:
             jac[jac == 0] = 1
             self.embed_vectors /= jac[:, None]
@@ -649,7 +672,7 @@ def sparsify_rows(matrix, iters=1):
 # This is my quick-and-dirty implementation of what Ben Schmidt calls
 # "Stable Random Projection." I'm not sure it's totally correct, but
 # the idea is from him.
-def srp_matrix(words, multiplier=10, sparsifier=2):
+def srp_matrix(words, multiplier, sparsifier=-1):
     hashes = [list(map(hash, ['{}_{}'.format(w, i) for w in words]))
               for i in range(multiplier)]
 
@@ -668,11 +691,14 @@ def srp_matrix(words, multiplier=10, sparsifier=2):
 
     hash_arr = numpy.unpackbits(hash_arr.ravel()).reshape(-1, 64 * multiplier)
 
-    # ...or even as an array of bits, where every word is represented
-    # by 640 bits, where pairs of bits are mapped to four bits with one
-    # positive value, which ensures greater sparsity.
-
-    return sparsify_rows(hash_arr, sparsifier)
+    if sparsifier >= 0:
+        # ...or even as an array of bits, where every word is represented
+        # by 640 bits, where pairs of bits are mapped to four bits with one
+        # positive value, which ensures greater sparsity, which is what
+        # sparsify_rows does if `sparsifier` is greater than 1.
+        return sparsify_rows(hash_arr, sparsifier).astype(numpy.int8)
+    else:
+        return hash_arr.astype(numpy.int8) * 2 - 1
 
 def resample_vectors(vecs):
     new_vecs = numpy.empty(vecs.shape, dtype=vecs.dtype)
@@ -739,6 +765,36 @@ def train_chunk_star_sp(docarray_hash_vectors):
 def train_chunk_star_jacobian(docarray_hash_vectors):
     docarray, hash_vectors = docarray_hash_vectors
     return train_chunk_jacobian_cy(docarray, hash_vectors)
+
+def train_chunk_star_jac_unnormed(docarray_hash_vectors):
+    docarray, hash_vectors = docarray_hash_vectors
+    return train_chunk_configurable_cy(docarray,
+                                       hash_vectors,
+                                       False,
+                                       False)
+
+def train_chunk_star_jac_arith(docarray_hash_vectors):
+    docarray, hash_vectors = docarray_hash_vectors
+    return train_chunk_configurable_cy(docarray,
+                                       hash_vectors,
+                                       True,
+                                       False)
+
+def train_chunk_star_jac_geom(docarray_hash_vectors):
+    docarray, hash_vectors = docarray_hash_vectors
+    return train_chunk_configurable_cy(docarray,
+                                       hash_vectors,
+                                       False,
+                                       True)
+
+def train_chunk_star_jac_arith_geom(docarray_hash_vectors):
+    docarray, hash_vectors = docarray_hash_vectors
+    return train_chunk_configurable_cy(docarray,
+                                       hash_vectors,
+                                       True,
+                                       True)
+
+
 
 # ########################
 # #### CORE FUNCTIONS ####
