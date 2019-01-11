@@ -295,7 +295,7 @@ cdef void cy_train_chunk_configurable(
         double[:] log_totals,
         double[:] jacobian,
         double[:, :] embed_vecs,
-        signed char[:, :] hash_vecs,
+        double[:, :] hash_vecs,
         int arithmetic_norm,
         int geometric_norm) nogil:
 
@@ -303,8 +303,10 @@ cdef void cy_train_chunk_configurable(
     cdef double len_doc_recip = 0
     cdef double poly_pow = 0
     cdef double jac_i = 0
+    cdef double jac_i_norm = 0
     cdef double counts_i = 0
     cdef double totals_i = 0
+    cdef double log_totals_i = 0
     cdef double hess_i_j = 0
     cdef double embed_dot = 0
 
@@ -342,13 +344,22 @@ cdef void cy_train_chunk_configurable(
             w_i = indices[start + i]
             counts_i = counts[start + i]
             totals_i = totals[start + i]
+            log_totals_i = log_totals[start + i]
 
             jac_i = (poly_pow +
                      log(counts_i) -
-                     log(log_totals[start + i]))
+                     log(log_totals_i))
+
+            # Normalize both the jacobian and the hessian, or neither.
+            if geometric_norm > 0:
+                # Multiplying because we're still in log space.
+                jac_i_norm = jac_i * len_doc_recip
+            else:
+                jac_i_norm = jac_i
 
             jacobian[w_i] = (jacobian[w_i] +
-                             exp(jac_i * len_doc_recip))
+                             exp(jac_i_norm))
+
             for j in range(hess_size):
                 hess_i_j = exp(jac_i +
                                log(counts[start + j]) -
@@ -491,23 +502,29 @@ def train_chunk_jacobian_cy(docarray, hash_vectors):
     nonzero_ix = embed_vectors.sum(axis=1) > 0
     return embed_vectors[nonzero_ix], jacobian[nonzero_ix], nonzero_ix.nonzero()
 
-def train_chunk_configurable_cy(docarray, hash_vectors,
-                                arithmetic_norm=False,
-                                geometric_norm=False):
+# For best performance, this is the function to use.
+def train_chunk_configurable_buffer_out(docarray, hash_vectors,
+                                        embed_vectors_out, embed_vectors_buf,
+                                        jacobian_out, jacobian_buf,
+                                        arithmetic_norm=False,
+                                        geometric_norm=False):
     ends, indices, counts, totals, log_totals = docarray.features()
     embed_vectors = numpy.zeros(hash_vectors.shape, dtype=numpy.float64)
     jacobian = numpy.zeros(hash_vectors.shape[0], dtype=numpy.float64)
 
     arithmetic_norm = int(bool(arithmetic_norm))
     geometric_norm = int(bool(geometric_norm))
-    cy_train_chunk_configurable(ends, indices, counts, totals, log_totals,
+    cy_train_chunk_configurable(ends, indices, counts,
+                                totals, log_totals,
                                 jacobian, embed_vectors, hash_vectors,
                                 arithmetic_norm, geometric_norm)
 
-    nonzero_ix = embed_vectors.sum(axis=1) > 0
-    return (embed_vectors[nonzero_ix],
-            jacobian[nonzero_ix],
-            nonzero_ix.nonzero())
+    with embed_vectors_buf.get_lock():
+        embed_vectors_out += embed_vectors
+
+    with jacobian_buf.get_lock():
+        jacobian_out += jacobian
+
 
 # This can be regarded as a middle-way reference implementation
 # that uses pure cython objects for inner loops (via the

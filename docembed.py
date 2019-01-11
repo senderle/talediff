@@ -1,21 +1,44 @@
 import numpy
 import multiprocessing
-import psutil
+
+import ctypes
+
+# import psutil
+
 from collections import Counter
 from collections import abc
 from itertools import islice
+
 from sparsehess import block_logspace_hessian as block_logspace_hessian_sp
-from sparsehess import train_chunk_py
 from sparsehess import train_chunk_cy
 from sparsehess import train_chunk_jacobian_cy
-from sparsehess import train_chunk_configurable_cy
+from sparsehess import train_chunk_configurable_buffer_out
+
+def _buffered_array_copy(array):
+    new_array, buff = _buffered_array(array.shape,
+                                      array.dtype)
+    new_array[:] = array
+    return new_array, buff
+
+def _buffered_array(shape, dtype):
+    dtype = numpy.dtype(dtype)
+    size = 1
+    for s in shape:
+        size *= s
+
+    n_bytes = size * dtype.itemsize
+    buff = multiprocessing.Array(ctypes.c_byte, n_bytes)
+    new_array = numpy.frombuffer(buff.get_obj(), dtype=dtype)
+    return new_array.reshape(shape), buff
 
 class ExtendWrap(abc.Sequence):
     def __init__(self, array):
         if isinstance(array, ExtendWrap):
-            array = array._array.copy()
-        self._array = array
-        self._len = array.shape[0]
+            array = array._array
+        new_array, buff = _buffered_array_copy(array)
+        self._buffer = buff
+        self._array = new_array
+        self._len = new_array.shape[0]
 
     def __len__(self):
         return self._len
@@ -30,31 +53,37 @@ class ExtendWrap(abc.Sequence):
     def array(self):
         return self._array[:self._len]
 
-    def trimmed(self):
-        return self._array[:self._len].copy()
-
     def trim(self):
-        self._array = self.trimmed()
+        # Remove any trailing empty space in the underlying array. This
+        # can be done by doing a `_buffered_array_copy` of the `array`
+        # property, which has the desired size. (So don't use `_array` here.)
+        self._array, self._buffer = _buffered_array_copy(self.array)
 
     def extend(self, new):
         old_len = self._len
         new_len = old_len + len(new)
         if new_len > self._array.shape[0]:
             new_shape = (new_len * 2,) + self._array.shape[1:]
-            array = numpy.zeros(new_shape, dtype=self._array.dtype)
-            array[:old_len] = self.array
-            self._array = array
+
+            new_array, buff = _buffered_array(new_shape, self._array.dtype)
+            new_array[:old_len] = self.array
+
+            self._array = new_array
+            self._buffer = buff
+
         self._array[old_len:new_len] = new
         self._len = new_len
 
 class DocArray(abc.Sequence):
-    def __init__(self, documents=None, eval_mode=''):
+    def __init__(self, documents=None, eval_mode='', flatten_counts=False):
         self.eval_mode = eval_mode
+        self.flatten_counts = flatten_counts
 
         if isinstance(documents, DocArray):
             self.words = list(documents.words)
             self.word_index = dict(documents.word_index)
             self._word_count = ExtendWrap(documents._word_count)
+            self._word_count_total = documents._word_count.array.sum()
             self._log_word_count = ExtendWrap(documents._log_counts)
             self._ends = ExtendWrap(documents._ends)
             self._indices = ExtendWrap(documents._indices)
@@ -64,6 +93,7 @@ class DocArray(abc.Sequence):
             self.word_index = {}
             self._word_count = ExtendWrap(
                 numpy.zeros(0, dtype=numpy.float64))
+            self._word_count_total = 0
             self._log_word_count = ExtendWrap(
                 numpy.zeros(0, dtype=numpy.float64))
             self._ends = ExtendWrap(
@@ -78,6 +108,20 @@ class DocArray(abc.Sequence):
                     self.extend(documents)
                 else:
                     self.extend_iter(documents)
+
+    @classmethod
+    def from_feature_tuple(cls, features):
+        w, wix, wc, wc_total, lwc, ends, indices, counts = features
+        da = cls()
+        da.words = w
+        da.word_index = wix
+        da._word_count = wc
+        da._word_count_total = wc_total
+        da._log_word_count = lwc
+        da._ends = ends
+        da._indices = indices
+        da._counts = counts
+        return da
 
     def __len__(self):
         return len(self._ends)
@@ -101,6 +145,7 @@ class DocArray(abc.Sequence):
             new.word_index = self.word_index
             new._ends.extend(new_ends)
             new._word_count.extend(self._word_count)
+            new._word_count_total = self._word_count_total
             new._log_word_count.extend(self._log_word_count)
             new._indices.extend(self._indices[new_index])
             new._counts.extend(self._counts[new_index])
@@ -117,12 +162,6 @@ class DocArray(abc.Sequence):
         left = DocArray(self)
         left.extend(right)
         return left
-
-    def save_memmap(self):
-        pass
-
-    def load_memmap(self):
-        pass
 
     def features(self):
         return (self._ends.array,
@@ -173,8 +212,12 @@ class DocArray(abc.Sequence):
             document_counts = [c.items() for c in document_counters]
 
             total = Counter(wix[w] for doc in documents for w in doc)
-            all_total = sum(total.values())
-            mean_word_freq = all_total / len(total)
+            self._word_count_total += sum(total.values())
+            word_count_total = self._word_count_total
+            mean_word_freq = word_count_total / len(self._word_count)
+            sq_word_prob_sum = sum((c / word_count_total) ** 2
+                                   for c in self._word_count)
+
             for ix, ct in total.items():
                 self._word_count[ix] += ct
                 if self.eval_mode == 'log':
@@ -183,14 +226,26 @@ class DocArray(abc.Sequence):
                 elif self.eval_mode == '1log':
                     self._log_word_count[ix] = \
                         1 / (numpy.log10(self._word_count[ix]) + 1)
+                elif self.eval_mode == 'unitscalefree':
+                    self._log_word_count[ix] = \
+                        numpy.exp(
+                            self._word_count[ix] / word_count_total -
+                            mean_word_freq / word_count_total)
                 elif self.eval_mode == 'scalefree':
                     self._log_word_count[ix] = \
-                        numpy.exp(self._word_count[ix] / all_total -
-                                  mean_word_freq / all_total)
+                        numpy.exp(
+                            self._word_count[ix] / word_count_total -
+                            sq_word_prob_sum)
                 elif self.eval_mode == '1scalefree':
                     self._log_word_count[ix] = \
-                        numpy.exp(mean_word_freq / all_total -
-                                  self._word_count[ix] / all_total)
+                        numpy.exp(
+                            sq_word_prob_sum -
+                            self._word_count[ix] / word_count_total)
+                elif self.eval_mode == '_test':
+                    self._log_word_count[ix] = \
+                        numpy.exp(
+                            self._word_count[ix] / word_count_total -
+                            sq_word_prob_sum)
                 elif self.eval_mode in ('', '1', 'one'):
                     self._log_word_count[ix] = 1
 
@@ -199,9 +254,15 @@ class DocArray(abc.Sequence):
                                     for i_c in doc])
             ends = numpy.cumsum([len(doc) for doc in document_counts])
 
+            # Ignore repetitions; this eliminates all nonlinearity
+            # from the polynomial.
+            if self.flatten_counts:
+                counts = [1 for x in counts]
+
             self._ends.extend(ends + len(self._indices))
             self._indices.extend(indices)
             self._counts.extend(counts)
+
 
 # OK: This word embedding model starts from the assumption that
 # words are types, and that individual instances of words --
@@ -357,15 +418,30 @@ class Embedding(object):
                                        self.multiplier,
                                        self.sparsifier)
         self.hash_iter_vectors = self.hash_vectors.copy()
-        self.embed_vectors = numpy.zeros(self.hash_vectors.shape)
+        self._new_embedding()
+
+    def _new_embedding(self):
+        emb, buf = _buffered_array(self.hash_vectors.shape,
+                                   dtype=numpy.float64)
+        emb[:] = 0
+        self.embed_vectors = emb
+        self.embed_vectors_buffer = buf
+
+        jac, jac_buf = _buffered_array((self.hash_vectors.shape[0],),
+                                       dtype=numpy.float64)
+        jac[:] = 0
+        self.jacobian_vector = jac
+        self.jacobian_vector_buffer = jac_buf
 
     def step_embedding(self):
         self.hash_iter_vectors = self._sparsify_embedding()
+        if hasattr(self, 'jacobian_vector'):
+            self.hash_iter_vectors /= self.jacobian_vector[:, None]
         self._erase_on_reset = True
 
     def _reset_embedding(self):
         if self._erase_on_reset:
-            self.embed_vectors = numpy.zeros(self.hash_iter_vectors.shape)
+            self._new_embedding()
 
     def get_vec(self, word):
         return self.embed_vectors[self.docarray.word_index[word]]
@@ -405,35 +481,76 @@ class Embedding(object):
         vec[dim] = 1
         return self.closest_words(vec, n_words, euclidean, mincount)
 
-    def _sparsify_embedding(self):
-        # The point of this is to recreate a binary project akin to
-        # the one generated by srp_matrix, but taking account of whatever
-        # new semantic information has been accrued by the embedding.
-        # Without this step, the vectors start to overfit badly. (Or
-        # at least that's what it looks like to me; really rare words
-        # start popping up as good matches.)
+    def _sparsify_embedding(self, use_embedding=False):
+        if use_embedding:
+            # This tries to transform the embedding into a new semi-random
+            # projection. In practice, it doesn't seem to make much difference.
+            return resample_vectors(self.embed_vectors)
+        else:
+            return srp_matrix(self.docarray.words,
+                              self.multiplier,
+                              self.sparsifier)
 
-        # We also have to be careful here because very common words
-        # will wind up appearing in every vector, and will lose their
-        # distinct character. As a result important distinguishing
-        # informaiton about other words is lost. (I.e. a word is more
-        # likely to be a noun if it appears along with "the" more
-        # often, but if we can't tell between "the" and "if," that
-        # information is lost.) So we need to have vectors for very
-        # common words be more sparse than vectors for rare words.
+    def _svd_prep(self, U, s):
+        return U[:, :len(s)], numpy.diag(s)
 
-        # It's not clear what approach solves these problems best.
-        # The approach implemented in `resample_vectors_median`
-        # worked OK, not great. The probabilistic approach implemented
-        # in `resample_vectors` was better, but much slower.
+    def _svd_test(self, test_matrix):
+        U, s, V = numpy.linalg.svd(test_matrix)
+        U_, s_ = self._svd_prep(U, s)
 
-        return resample_vectors(self.embed_vectors)
+        # Sanity checks...
+
+        # Does U @ s @ V reconstruct the data?
+        assert numpy.allclose(U_ @ s_ @ V, test_matrix, atol=1e-05)
+
+        # Does X @ V.T == U @ s?
+        assert numpy.allclose(U_ @ s_, test_matrix @ V.T)
+
+        return U, s, V
+
+    def _svd_sq_test(self, raw_matrix, full_test=False):
+        if full_test:
+            mean = raw_matrix.mean(axis=0)
+            std = raw_matrix.std(axis=0)
+
+            matrix = raw_matrix - mean
+            matrix /= std
+        else:
+            matrix = raw_matrix
+
+        U_sq, s_sq, V_sq = self._svd_test(matrix.T @ matrix)
+        result = matrix @ V_sq.T
+
+        mean = matrix.mean(axis=0)
+        std = matrix.std(axis=0)
+        neg = matrix < 0
+        print(matrix[neg].ravel().sum())
+        print((mean * mean).sum() ** 0.5)
+        print((std * std).sum() ** 0.5)
+
+        if full_test:
+            U, s, V = self._svd_test(matrix)
+            assert numpy.allclose(s * s, s_sq, atol=1e-07)
+
+            U, s = self._svd_prep(U, s)
+            assert numpy.allclose(numpy.abs(U @ s),
+                                  numpy.abs(result))
+
+        return result, s_sq
 
     def _eigen_embedding(self):
         ev = self.embed_vectors
-        ev -= ev.mean(axis=0)
-        U, s, V = numpy.linalg.svd(ev.T @ ev)
-        result = ev @ U.T
+        sample = numpy.random.choice(len(ev), size=ev.shape[1] * 100)
+        ev_sample = (ev[sample])
+
+        # Thorough test on a subsample
+        result, s = self._svd_sq_test(ev_sample)
+
+        # If the above test passes, then we can pass the full set of
+        # embedding vectors, and skip the full test, which will run
+        # out of memory on the full set.
+        result, s = self._svd_sq_test(ev, full_test=False)
+
         print('  -- SVD --')
         print('Shape of embedding vectors:')
         print('{} rows, {} columns'.format(*ev.shape))
@@ -441,9 +558,8 @@ class Embedding(object):
         print(s[:10])
         print('Last 10 values of s:')
         print(s[-10:])
-        print('Shape of output vectors:')
-        print('{} rows, {} columns'.format(*result.shape))
-        return result
+
+        return result, s
 
     def train(self):
         self._reset_embedding()
@@ -462,7 +578,7 @@ class Embedding(object):
 
         n_words, n_dims = embed_shape
         min_chunksize = 1000
-        max_chunksize = 2 ** 25 // n_dims
+        max_chunksize = 2 ** 24 // n_dims
         n_docs = len(self.docarray)
         n_procs = multiprocessing.cpu_count()
         chunksize = n_docs // n_procs + 1
@@ -482,50 +598,58 @@ class Embedding(object):
                     arithmetic_norm=False,
                     geometric_norm=False):
         self._reset_embedding()
-        hash_vectors = self.hash_iter_vectors
+
+        if arithmetic_norm and geometric_norm:
+            train = train_chunk_global_out_arith_geom
+        elif geometric_norm:
+            train = train_chunk_global_out_geom
+        elif arithmetic_norm:
+            train = train_chunk_global_out_arith
+        else:
+            train = train_chunk_global_out_unnormed
+
+        chunksize, n_procs = self._chunkparams(self.hash_iter_vectors.shape)
+
+        global MP_DOC_ARRAY, MP_HASH_VECS
+        global MP_EMBED_OUT, MP_EMBED_BUF
+        global MP_JACOB_OUT, MP_JACOB_BUF
+
+        MP_DOC_ARRAY = self.docarray
+        MP_HASH_VECS = self.hash_iter_vectors
+        MP_EMBED_OUT = self.embed_vectors
+        MP_EMBED_BUF = self.embed_vectors_buffer
+        MP_JACOB_OUT = self.jacobian_vector
+        MP_JACOB_BUF = self.jacobian_vector_buffer
+
+        slices = (slice(i, i + chunksize)
+                  for i in range(0, len(self.docarray), chunksize))
+
         n_docs = len(self.docarray)
-        chunksize, n_procs = self._chunkparams(hash_vectors.shape)
-
-        # For reasons I do not fully understand, multiprocessing doesn't
-        # schedule large chunks very well; we wind up using just two
-        # or three processors at a time even when more are available.
-        # So we divide our chunks into sub-chunks, and process each
-        # sub-chunk in a new pool. This adds more overhead than I like
-        # but it speeds up large processes according to my tests. There's
-        # probably a more correct solution to this problem, but I don't
-        # know what it is.
-
-        all_chunks = ((self.docarray[i:i + chunksize], hash_vectors)
-                      for i in range(0, len(self.docarray), chunksize))
-        chunk_ct = 0
+        n_chunks = n_docs // chunksize + 1
+        tenth = max(n_chunks // 10, 1)
         print("Starting multiprocessing:")
         print("    {} processes".format(n_procs))
         print("    {} tasks per chunk".format(chunksize))
-        print("    ~{} chunks".format(n_docs // chunksize + 1))
+        print("    ~{} chunks".format(n_chunks))
+        print("    completed: 0... ", end='', flush=True)
 
-        jac = numpy.zeros(self.embed_vectors.shape[0], dtype=numpy.float64)
-        if arithmetic_norm and geometric_norm:
-            train = train_chunk_star_jac_arith_geom
-        elif geometric_norm:
-            train = train_chunk_star_jac_geom
-        elif arithmetic_norm:
-            train = train_chunk_star_jac_arith
-        else:
-            train = train_chunk_star_jac_unnormed
-
-        for chunks in self._chunkslicer(all_chunks, n_procs):
-            print('processing chunks {}-{}'.format(chunk_ct,
-                                                   chunk_ct + len(chunks)))
-            chunk_ct += len(chunks)
-            with multiprocessing.Pool(processes=n_procs) as pool:
-                for result in pool.imap(train, chunks):
-                    ev_r, jac_r, ix_r = result
-                    self.embed_vectors[ix_r] += ev_r
-                    jac[ix_r] += jac_r
+        with multiprocessing.Pool(processes=n_procs,
+                                  maxtasksperchild=10) as pool:
+            chunk_ct = 0
+            for result in pool.imap_unordered(train, slices):
+                chunk_ct += 1
+                if chunk_ct % tenth == 0:
+                    print('{}... '.format(chunk_ct),
+                          end='',
+                          flush=True)
+                    if chunk_ct % (tenth * 5) == 0:
+                        print()
+                        print('               ')
+            print()
 
         if with_jacobian:
-            jac[jac == 0] = 1
-            self.embed_vectors /= jac[:, None]
+            self.jacobian_vector[self.jacobian_vector == 0] = 1
+            self.embed_vectors /= self.jacobian_vector[:, None]
 
     def train_simple(self):
         self._reset_embedding()
@@ -555,7 +679,9 @@ class Embedding(object):
             truncate = self.embed_vectors.shape[1]
             embed_vectors = self.embed_vectors
         else:
-            embed_vectors = self._eigen_embedding()
+            embed_vectors, s = self._eigen_embedding()
+            if truncate <= 0:
+                truncate = len(s[s > 0.001])
 
         if include_annotated:
             truncate //= 2
@@ -573,6 +699,16 @@ class Embedding(object):
                  if tot[wix[w]] >= mincount and not w.endswith('_')]
 
         vecs = [embed_vectors[wix[w]][:truncate] for w in words]
+
+        # Experiment: what happens when we randomly select dimensions
+        # instead of always truncating dimensions with low signular values?
+        # (Only applicable when _eigen_embedding has been called.)
+        # Unfortunately, nothing interesitng happened.
+
+        # vec_len = len(embed_vectors[wix[next(iter(wix))]])
+        # random_sample = random.sample(range(vec_len), truncate)
+        # vecs = [embed_vectors[wix[w]][random_sample] for w in words]
+
         if include_annotated:
             # Concatenate the vectors for annotated and
             # unannotated versions of each word.
@@ -584,6 +720,7 @@ class Embedding(object):
         rows = ['{} {}\n'.format(w, ' '.join(str(v) for v in vec))
                 for w, vec in zip(words, vecs)]
 
+        print('Final vector size: {} dimensions'.format(len(vecs[0])))
         with open(filename, 'w', encoding='utf-8') as op:
             for r in rows:
                 op.write(r)
@@ -647,6 +784,7 @@ class Embedding(object):
         else:
             print('All chunkwise training tests passed.')
 
+
 # ###########################
 # #### Utility Functions ####
 # ###########################
@@ -696,9 +834,11 @@ def srp_matrix(words, multiplier, sparsifier=-1):
         # by 640 bits, where pairs of bits are mapped to four bits with one
         # positive value, which ensures greater sparsity, which is what
         # sparsify_rows does if `sparsifier` is greater than 1.
-        return sparsify_rows(hash_arr, sparsifier).astype(numpy.int8)
+        out = sparsify_rows(hash_arr, sparsifier).astype(numpy.float64)
     else:
-        return hash_arr.astype(numpy.int8) * 2 - 1
+        out = hash_arr.astype(numpy.float64) * 2 - 1
+
+    return out
 
 def resample_vectors(vecs):
     new_vecs = numpy.empty(vecs.shape, dtype=vecs.dtype)
@@ -766,34 +906,37 @@ def train_chunk_star_jacobian(docarray_hash_vectors):
     docarray, hash_vectors = docarray_hash_vectors
     return train_chunk_jacobian_cy(docarray, hash_vectors)
 
-def train_chunk_star_jac_unnormed(docarray_hash_vectors):
-    docarray, hash_vectors = docarray_hash_vectors
-    return train_chunk_configurable_cy(docarray,
-                                       hash_vectors,
-                                       False,
-                                       False)
+# This ridiculous series of functions is required because
+# multiprocessing still can't sensibly handle dynamic function
+# generation.
 
-def train_chunk_star_jac_arith(docarray_hash_vectors):
-    docarray, hash_vectors = docarray_hash_vectors
-    return train_chunk_configurable_cy(docarray,
-                                       hash_vectors,
-                                       True,
-                                       False)
+def train_chunk_global_out_unnormed(slice):
+    train_chunk_configurable_buffer_out(
+        MP_DOC_ARRAY[slice], MP_HASH_VECS,
+        MP_EMBED_OUT, MP_EMBED_BUF,
+        MP_JACOB_OUT, MP_JACOB_BUF,
+        False, False)
 
-def train_chunk_star_jac_geom(docarray_hash_vectors):
-    docarray, hash_vectors = docarray_hash_vectors
-    return train_chunk_configurable_cy(docarray,
-                                       hash_vectors,
-                                       False,
-                                       True)
+def train_chunk_global_out_arith(slice):
+    train_chunk_configurable_buffer_out(
+        MP_DOC_ARRAY[slice], MP_HASH_VECS,
+        MP_EMBED_OUT, MP_EMBED_BUF,
+        MP_JACOB_OUT, MP_JACOB_BUF,
+        True, False)
 
-def train_chunk_star_jac_arith_geom(docarray_hash_vectors):
-    docarray, hash_vectors = docarray_hash_vectors
-    return train_chunk_configurable_cy(docarray,
-                                       hash_vectors,
-                                       True,
-                                       True)
+def train_chunk_global_out_geom(slice):
+    train_chunk_configurable_buffer_out(
+        MP_DOC_ARRAY[slice], MP_HASH_VECS,
+        MP_EMBED_OUT, MP_EMBED_BUF,
+        MP_JACOB_OUT, MP_JACOB_BUF,
+        False, True)
 
+def train_chunk_global_out_arith_geom(slice):
+    train_chunk_configurable_buffer_out(
+        MP_DOC_ARRAY[slice], MP_HASH_VECS,
+        MP_EMBED_OUT, MP_EMBED_BUF,
+        MP_JACOB_OUT, MP_JACOB_BUF,
+        True, True)
 
 
 # ########################

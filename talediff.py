@@ -3,6 +3,7 @@ import re
 import string
 import argparse
 import subprocess
+import numpy
 from itertools import islice
 
 from docembed import DocArray
@@ -35,6 +36,26 @@ def load_and_make_windows(txt, window_size=15):
              for i in range(0, len(sents), window_size)]
     return sents
 
+def random_window_gen(mean, std, block_size=1000):
+    while True:
+        for v in numpy.random.normal(mean, std, block_size):
+            yield int(v)
+
+def load_and_make_random_windows(txt, window_size=15, reps=1):
+    words = _allpunct_rex.sub('', txt.lower()).split()
+    for i in range(reps):
+        start = 0
+        for size in random_window_gen(window_size, window_size // 2):
+            if size < 3:
+                continue
+            end = start + size
+            yield words[start:end]
+
+            start = end
+            if start >= len(words):
+                break
+
+
 # Here, "annotation" means creating overlapping windows,
 # where very course-grained word position information is
 # retained by prepending an underscore to the words in
@@ -63,7 +84,8 @@ def load(fn, window_size=15, annotate=True):
     elif annotate:
         return load_and_annotate_windows(txt, window_size)
     else:
-        return load_and_make_windows(txt, window_size)
+        # return load_and_make_windows(txt, window_size)
+        return load_and_make_random_windows(txt, window_size)
 
 def group(it, n):
     it = iter(it)
@@ -207,13 +229,13 @@ def parse_args():
         '-w',
         '--window-size',
         type=int,
-        default=30,
-        help='The width of the context window (for input that cannot be '
-        'parsed into sentences). This matches the default GloVe test '
-        'settings. (The GloVe test settings are misleading; they '
-        'use 15 as the window size, but they consider 15-word windows '
-        'preceding *and* following each word which doubles the effective '
-        'window size.'
+        default=60,
+        help='The width of the average context window (for input that '
+        'cannot be parsed into sentences). Defaults to 60. The length of '
+        'each window is sampled from a gaussian distribution with this as '
+        'the mean. (For comparison, the default GloVe settings use a '
+        'bidirectional 15-word window, effectively resulting in a 30-word '
+        'window, and GloVe does not randomly vary the window size.'
     )
     parser.add_argument(
         '-a',
@@ -225,15 +247,24 @@ def parse_args():
         'produce good results.'
     )
     parser.add_argument(
+        '-f',
+        '--flatten-counts',
+        action='store_true',
+        default=False,
+        help='Remove all repetitions, "flattening" the word counts for each '
+        'sentence. This gives a more standard version of the coocurrence '
+        'matrix.'
+    )
+    parser.add_argument(
         '-m',
         '--hash-vector-multiplier',
         type=int,
-        default=20,
+        default=5,
         help='A parameter that helps determine the length of the hash '
         'vectors, along with --hash-vector-sparsifier, below. We generate '
         'random binary projection vectors using the hash of the given '
         'word; hashes are 64-bits long, so if the sparsifier is 0, then '
-        'a multiplier of 10 gives a 640-dimension vector. The total number '
+        'a multiplier of 5 gives a 320-dimension vector. The total number '
         'of dimensions is equal to 64 * multiplier * sparsifier.'
     )
     parser.add_argument(
@@ -242,11 +273,10 @@ def parse_args():
         type=int,
         default=-1,
         help='A parameter that "stretches" the hash vectors by padding them '
-        'with evenly spaced zeros. Some degree of sparsity ensures that '
-        'the final embedding vectors have better interpretability. See '
+        'with evenly spaced zeros. This may help model interpretability. See '
         '--hash-vector-multiplier as well. A value less than zero indicates '
         'dense vectors of positive and negative values, instead of ones and '
-        'zeros.'
+        'zeros (the default behavior).'
     )
     parser.add_argument(
         '-n',
@@ -317,12 +347,11 @@ def parse_args():
         '-v',
         '--eval-mode',
         default='1',
-        choices=['1', 'log', '1log', 'scalefree', '1scalefree'],
+        choices=['1', 'log', '1log', 'scalefree',
+                 '1scalefree', 'unitscalefree'],
         type=str,
         help='Mode for selecting a point in expressivity space for evaluating '
         'the jacobian and hessian. Defaults to the one-point (1, 1, 1, ...). '
-        'Any truthy argument activates log-total mode, which uses the log of '
-        'each word\'s frequency in the corpus.'
     )
 
     args = parser.parse_args()
@@ -346,7 +375,9 @@ def main(args):
     if args.number_of_windows > 0:
         alldocs = islice(alldocs, args.number_of_windows)
 
-    alldocs = DocArray(alldocs, eval_mode=args.eval_mode)
+    alldocs = DocArray(alldocs,
+                       eval_mode=args.eval_mode,
+                       flatten_counts=args.flatten_counts)
     emb = Embedding(alldocs,
                     multiplier=args.hash_vector_multiplier,
                     sparsifier=args.hash_vector_sparsifier)
@@ -371,8 +402,13 @@ def main_train(emb, args):
         if args.demo:
             demo_out(emb, i)
 
-    truncate = args.save_truncated_vectors
-    truncate = truncate if truncate > 0 else None
+    try:
+        truncate = int(args.save_truncated_vectors)
+        if truncate == 0:
+            truncate = None
+    except ValueError:
+        truncate = None
+
     emb.save_vectors('vectors.txt',
                      mincount=args.save_mincount,
                      truncate=truncate,
