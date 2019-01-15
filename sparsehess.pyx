@@ -168,125 +168,6 @@ cdef void cy_train_chunk_combined(
 @cython.boundscheck(False)
 @cython.cdivision(True)
 @cython.wraparound(False)
-cdef void cy_train_chunk_jacobian(
-        long[:] ends,
-        long[:] indices,
-        double[:] counts,
-        double[:] totals,
-        double[:] log_totals,
-        double[:] jacobian,
-        double[:, :] embed_vecs,
-        signed char[:, :] hash_vecs) nogil:
-
-    # Memorably named temp variables.
-    cdef double len_doc_recip = 0
-    cdef double poly_pow = 0
-    cdef double jac_i = 0
-    cdef double counts_i = 0
-    cdef double totals_i = 0
-    cdef double hess_i_j = 0
-    cdef double embed_dot = 0
-
-    # Boundaries and index variables.
-    cdef long n_docs = ends.shape[0]
-    cdef long start = 0
-    cdef long end = 0
-    cdef long hess_size = 0
-    cdef long embed_size = hash_vecs.shape[1]
-    cdef long i, j, k, w_i, w_j, doc_ix
-
-    # This performs almost the same operation as the above function
-    # `cy_train_chunk_combined`, but in addition to updating the
-    # hessian matrix, it updates a jacobian vector, which can then
-    # be used later, outside the tight loop -- as a normalization
-    # constant, for example. See the notes to the above function
-    # for details about the ragged array iteration being performed
-    # here. In places where the two functions are the same, the
-    # comments here are retained, but occasionally simplified.
-
-    for doc_ix in range(n_docs):
-        end = ends[doc_ix]
-        hess_size = end - start
-
-        # Calculate the sum of word counts for the given documents.
-        # This will be used to calculate mean values later.
-        len_doc_recip = 0
-        for i in range(hess_size):
-            len_doc_recip += counts[start + i]
-
-        # Documents with only one word do us no good.
-        if len_doc_recip < 2:
-            continue
-
-        len_doc_recip = 1 / len_doc_recip
-
-        # Calculate the value of the pre-derivative polynomial
-        # term (in log space). For a two-variable term, this is
-        # just x ^ n * y ^ m.
-        poly_pow = 0
-        for i in range(hess_size):
-            poly_pow = poly_pow + log(log_totals[start + i]) * counts[start + i]
-
-        # Calculate the value of the hessian for the term, mostly
-        # in log space. Then multiply it (dot product) by the
-        # random hash vectors, as a low-budget form of dimension
-        # reduction.
-        for i in range(hess_size):
-            # Precompute variables depending only on i
-            w_i = indices[start + i]
-            counts_i = counts[start + i]
-            totals_i = totals[start + i]
-
-            # Calculate the jacobian for word i
-            jac_i = (poly_pow +
-                     log(counts_i) -
-                     log(log_totals[start + i]))
-            jacobian[w_i] = (jacobian[w_i] +
-                             exp(jac_i * len_doc_recip))
-            for j in range(hess_size):
-                # This turns x ^ n * y ^ m into n * x ^ (n - 1) *
-                # m * y ^ (m - 1), implementing the power rule
-                # for mixed partial derivatives. It happens in
-                # log space.
-                hess_i_j = exp(jac_i +
-                               log(counts[start + j]) -
-                               log(log_totals[start + j]))
-
-                # This turns n * n * x ^ (n - 2) into n * (n - 1) *
-                # x ^ (n - 2) along the diagonal *only*. This is
-                # necessary because the diagonal contains second
-                # partial derivatives of one variable instaed of
-                # mixed partial derivatives of two variables. It
-                # happens in linear space because (n - 1) will
-                # often be zero, and a zero multiplication in log
-                # space could be trouble. (0 == -inf in log space!)
-                if i == j:
-                    hess_i_j *= (counts_i - 1) / counts_i
-
-                # Geometric mean w.r.t. doc length and arithmetic
-                # mean w.r.t total word frequency.
-                # hess_i_j = (hess_i_j ** len_doc_recip /
-                #             (totals_i))
-                # hess_i_j = hess_i_j / totals_i
-                hess_i_j = hess_i_j ** len_doc_recip
-
-                # A bit sloppy: assume nan == 0
-                if isnan(hess_i_j) or isinf(hess_i_j):
-                    continue
-
-                # Sparse dot product over random hash vectors.
-                w_j = indices[start + j]
-                for k in range(embed_size):
-                    embed_dot = (embed_vecs[w_i, k] +
-                                 hess_i_j *
-                                 hash_vecs[w_j, k])
-                    embed_vecs[w_i, k] = embed_dot
-
-        start = end
-
-@cython.boundscheck(False)
-@cython.cdivision(True)
-@cython.wraparound(False)
 cdef void cy_train_chunk_configurable(
         long[:] ends,
         long[:] indices,
@@ -369,6 +250,103 @@ cdef void cy_train_chunk_configurable(
                     hess_i_j *= (counts_i - 1) / counts_i
                 if geometric_norm > 0:
                     hess_i_j = hess_i_j ** len_doc_recip
+                if arithmetic_norm > 0:
+                    hess_i_j = hess_i_j / totals_i
+                if isnan(hess_i_j) or isinf(hess_i_j):
+                    continue
+
+                w_j = indices[start + j]
+                for k in range(embed_size):
+                    embed_dot = (embed_vecs[w_i, k] +
+                                 hess_i_j *
+                                 hash_vecs[w_j, k])
+                    embed_vecs[w_i, k] = embed_dot
+
+        start = end
+
+@cython.boundscheck(False)
+@cython.cdivision(True)
+@cython.wraparound(False)
+cdef void cy_train_chunk_configurable_scaling(
+        long[:] ends,
+        long[:] indices,
+        double[:] counts,
+        double[:] totals,
+        double[:] log_totals,
+        double[:] jacobian,
+        double[:, :] embed_vecs,
+        double[:, :] hash_vecs,
+        double geometric_scaling,
+        int arithmetic_norm) nogil:
+
+    # Memorably named temp variables.
+    cdef double len_doc_recip = 0
+    cdef double poly_pow = 0
+    cdef double jac_i = 0
+    cdef double jac_i_norm = 0
+    cdef double counts_i = 0
+    cdef double totals_i = 0
+    cdef double log_totals_i = 0
+    cdef double hess_i_j = 0
+    cdef double embed_dot = 0
+
+    # Boundaries and index variables.
+    cdef long n_docs = ends.shape[0]
+    cdef long start = 0
+    cdef long end = 0
+    cdef long hess_size = 0
+    cdef long embed_size = hash_vecs.shape[1]
+    cdef long i, j, k, w_i, w_j, doc_ix
+
+    # This performs almost the same operation as the above function
+    # `cy_train_chunk_jacobian`, but provides several configurable
+    # behaviors. Notes are omitted entirely; for documentation, see
+    # comments to above functions.
+
+    for doc_ix in range(n_docs):
+        end = ends[doc_ix]
+        hess_size = end - start
+
+        len_doc_recip = 0
+        for i in range(hess_size):
+            len_doc_recip += counts[start + i]
+
+        if len_doc_recip < 2:
+            continue
+
+        len_doc_recip = 1 / (len_doc_recip ** geometric_scaling)
+
+        poly_pow = 0
+        for i in range(hess_size):
+            poly_pow = poly_pow + log(log_totals[start + i]) * counts[start + i]
+
+        for i in range(hess_size):
+            w_i = indices[start + i]
+            counts_i = counts[start + i]
+            totals_i = totals[start + i]
+            log_totals_i = log_totals[start + i]
+
+            jac_i = (poly_pow +
+                     log(counts_i) -
+                     log(log_totals_i))
+
+            # Geometric scaling is applied to both the jacobian and hessian.
+            # Multiplying because we're still in log space.
+            jac_i_norm = jac_i * len_doc_recip
+
+            jacobian[w_i] = (jacobian[w_i] +
+                             exp(jac_i_norm))
+
+            for j in range(hess_size):
+                hess_i_j = exp(jac_i +
+                               log(counts[start + j]) -
+                               log(log_totals[start + j]))
+
+                if i == j:
+                    hess_i_j *= (counts_i - 1) / counts_i
+
+                # Geometric scaling; out of log space so it's a power now.
+                hess_i_j = hess_i_j ** len_doc_recip
                 if arithmetic_norm > 0:
                     hess_i_j = hess_i_j / totals_i
                 if isnan(hess_i_j) or isinf(hess_i_j):
@@ -491,23 +469,12 @@ def train_chunk_cy(docarray, hash_vectors):
     nonzero_ix = embed_vectors.sum(axis=1) > 0
     return embed_vectors[nonzero_ix], nonzero_ix.nonzero()
 
-def train_chunk_jacobian_cy(docarray, hash_vectors):
-    ends, indices, counts, totals, log_totals = docarray.features()
-    embed_vectors = numpy.zeros(hash_vectors.shape, dtype=numpy.float64)
-    jacobian = numpy.zeros(hash_vectors.shape[0], dtype=numpy.float64)
-
-    cy_train_chunk_jacobian(ends, indices, counts, totals,
-                            log_totals, jacobian, embed_vectors, hash_vectors)
-
-    nonzero_ix = embed_vectors.sum(axis=1) > 0
-    return embed_vectors[nonzero_ix], jacobian[nonzero_ix], nonzero_ix.nonzero()
-
 # For best performance, this is the function to use.
-def train_chunk_configurable_buffer_out(docarray, hash_vectors,
-                                        embed_vectors_out, embed_vectors_buf,
-                                        jacobian_out, jacobian_buf,
-                                        arithmetic_norm=False,
-                                        geometric_norm=False):
+def train_chunk_configurable(docarray, hash_vectors,
+                             embed_vectors_out, embed_vectors_buf,
+                             jacobian_out, jacobian_buf,
+                             arithmetic_norm=False,
+                             geometric_norm=False):
     ends, indices, counts, totals, log_totals = docarray.features()
     embed_vectors = numpy.zeros(hash_vectors.shape, dtype=numpy.float64)
     jacobian = numpy.zeros(hash_vectors.shape[0], dtype=numpy.float64)
@@ -524,6 +491,28 @@ def train_chunk_configurable_buffer_out(docarray, hash_vectors,
 
     with jacobian_buf.get_lock():
         jacobian_out += jacobian
+
+def train_chunk_configurable_scaling(docarray, hash_vectors,
+                                     embed_vectors_out, embed_vectors_buf,
+                                     jacobian_out, jacobian_buf,
+                                     geometric_scaling,
+                                     arithmetic_norm=False):
+    ends, indices, counts, totals, log_totals = docarray.features()
+    embed_vectors = numpy.zeros(hash_vectors.shape, dtype=numpy.float64)
+    jacobian = numpy.zeros(hash_vectors.shape[0], dtype=numpy.float64)
+
+    arithmetic_norm = int(bool(arithmetic_norm))
+    cy_train_chunk_configurable_scaling(ends, indices, counts,
+                                        totals, log_totals,
+                                        jacobian, embed_vectors, hash_vectors,
+                                        geometric_scaling, arithmetic_norm)
+
+    with embed_vectors_buf.get_lock():
+        embed_vectors_out += embed_vectors
+
+    with jacobian_buf.get_lock():
+        jacobian_out += jacobian
+
 
 
 # This can be regarded as a middle-way reference implementation

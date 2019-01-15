@@ -220,10 +220,15 @@ def parse_args():
     )
     parser.add_argument(
         '-g',
-        '--geometric-norm',
-        action='store_true',
-        default=False,
-        help='Use geometric normalization.'
+        '--geometric-scaling',
+        type=float,
+        default=1,
+        help='A geometric scaling factor. A value of 0 is equivalent to an '
+        'ordinary power of the terms for a sentence, while a value of 1 is '
+        'equivalent to the geometric mean of the terms. Since sentence '
+        'length may vary, nonzero values smooth out variation. But they also '
+        'have subtle effects on the way the hessian approximates '
+        'nonlinearities caused by repeated terms. Defaults to 1.'
     )
     parser.add_argument(
         '-w',
@@ -398,7 +403,7 @@ def main_train(emb, args):
         print('Iteration {}...'.format(i))
         emb.train_multi(with_jacobian=args.with_jacobian,
                         arithmetic_norm=args.arithmetic_norm,
-                        geometric_norm=args.geometric_norm)
+                        geometric_scaling=args.geometric_scaling)
         if args.demo:
             demo_out(emb, i)
 

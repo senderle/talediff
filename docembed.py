@@ -11,8 +11,8 @@ from itertools import islice
 
 from sparsehess import block_logspace_hessian as block_logspace_hessian_sp
 from sparsehess import train_chunk_cy
-from sparsehess import train_chunk_jacobian_cy
-from sparsehess import train_chunk_configurable_buffer_out
+from sparsehess import train_chunk_configurable
+from sparsehess import train_chunk_configurable_scaling
 
 def _buffered_array_copy(array):
     new_array, buff = _buffered_array(array.shape,
@@ -530,7 +530,7 @@ class Embedding(object):
 
         if full_test:
             U, s, V = self._svd_test(matrix)
-            assert numpy.allclose(s * s, s_sq, atol=1e-07)
+            assert numpy.allclose(s * s, s_sq, atol=1e-05)
 
             U, s = self._svd_prep(U, s)
             assert numpy.allclose(numpy.abs(U @ s),
@@ -540,7 +540,7 @@ class Embedding(object):
 
     def _eigen_embedding(self):
         ev = self.embed_vectors
-        sample = numpy.random.choice(len(ev), size=ev.shape[1] * 100)
+        sample = numpy.random.choice(len(ev), size=ev.shape[1] * 20)
         ev_sample = (ev[sample])
 
         # Thorough test on a subsample
@@ -596,23 +596,15 @@ class Embedding(object):
     def train_multi(self,
                     with_jacobian=False,
                     arithmetic_norm=False,
-                    geometric_norm=False):
+                    geometric_scaling=1):
         self._reset_embedding()
-
-        if arithmetic_norm and geometric_norm:
-            train = train_chunk_global_out_arith_geom
-        elif geometric_norm:
-            train = train_chunk_global_out_geom
-        elif arithmetic_norm:
-            train = train_chunk_global_out_arith
-        else:
-            train = train_chunk_global_out_unnormed
 
         chunksize, n_procs = self._chunkparams(self.hash_iter_vectors.shape)
 
         global MP_DOC_ARRAY, MP_HASH_VECS
         global MP_EMBED_OUT, MP_EMBED_BUF
         global MP_JACOB_OUT, MP_JACOB_BUF
+        global MP_GEOM_SCALE, MP_ARITH_NORM
 
         MP_DOC_ARRAY = self.docarray
         MP_HASH_VECS = self.hash_iter_vectors
@@ -620,6 +612,8 @@ class Embedding(object):
         MP_EMBED_BUF = self.embed_vectors_buffer
         MP_JACOB_OUT = self.jacobian_vector
         MP_JACOB_BUF = self.jacobian_vector_buffer
+        MP_GEOM_SCALE = geometric_scaling
+        MP_ARITH_NORM = arithmetic_norm
 
         slices = (slice(i, i + chunksize)
                   for i in range(0, len(self.docarray), chunksize))
@@ -636,15 +630,15 @@ class Embedding(object):
         with multiprocessing.Pool(processes=n_procs,
                                   maxtasksperchild=10) as pool:
             chunk_ct = 0
-            for result in pool.imap_unordered(train, slices):
+            for result in pool.imap_unordered(train_chunk_multi, slices):
                 chunk_ct += 1
                 if chunk_ct % tenth == 0:
+                    if chunk_ct % (tenth * 5) == 0:
+                        print()
+                        print('               ', end='')
                     print('{}... '.format(chunk_ct),
                           end='',
                           flush=True)
-                    if chunk_ct % (tenth * 5) == 0:
-                        print()
-                        print('               ')
             print()
 
         if with_jacobian:
@@ -902,42 +896,16 @@ def train_chunk_star_sp(docarray_hash_vectors):
     docarray, hash_vectors = docarray_hash_vectors
     return train_chunk_cy(docarray, hash_vectors)
 
-def train_chunk_star_jacobian(docarray_hash_vectors):
-    docarray, hash_vectors = docarray_hash_vectors
-    return train_chunk_jacobian_cy(docarray, hash_vectors)
-
 # This ridiculous series of functions is required because
 # multiprocessing still can't sensibly handle dynamic function
 # generation.
 
-def train_chunk_global_out_unnormed(slice):
-    train_chunk_configurable_buffer_out(
+def train_chunk_multi(slice):
+    train_chunk_configurable_scaling(
         MP_DOC_ARRAY[slice], MP_HASH_VECS,
         MP_EMBED_OUT, MP_EMBED_BUF,
         MP_JACOB_OUT, MP_JACOB_BUF,
-        False, False)
-
-def train_chunk_global_out_arith(slice):
-    train_chunk_configurable_buffer_out(
-        MP_DOC_ARRAY[slice], MP_HASH_VECS,
-        MP_EMBED_OUT, MP_EMBED_BUF,
-        MP_JACOB_OUT, MP_JACOB_BUF,
-        True, False)
-
-def train_chunk_global_out_geom(slice):
-    train_chunk_configurable_buffer_out(
-        MP_DOC_ARRAY[slice], MP_HASH_VECS,
-        MP_EMBED_OUT, MP_EMBED_BUF,
-        MP_JACOB_OUT, MP_JACOB_BUF,
-        False, True)
-
-def train_chunk_global_out_arith_geom(slice):
-    train_chunk_configurable_buffer_out(
-        MP_DOC_ARRAY[slice], MP_HASH_VECS,
-        MP_EMBED_OUT, MP_EMBED_BUF,
-        MP_JACOB_OUT, MP_JACOB_BUF,
-        True, True)
-
+        MP_GEOM_SCALE, MP_ARITH_NORM)
 
 # ########################
 # #### CORE FUNCTIONS ####
