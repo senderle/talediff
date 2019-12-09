@@ -9,10 +9,7 @@ from collections import Counter
 from collections import abc
 from itertools import islice
 
-from sparsehess import block_logspace_hessian as block_logspace_hessian_sp
-from sparsehess import train_chunk_cy
-from sparsehess import train_chunk_configurable
-from sparsehess import train_chunk_configurable_scaling
+import util
 
 def _buffered_array_copy(array):
     new_array, buff = _buffered_array(array.shape,
@@ -75,11 +72,17 @@ class ExtendWrap(abc.Sequence):
         self._len = new_len
 
 class DocArray(abc.Sequence):
-    def __init__(self, documents=None, eval_mode='', flatten_counts=False):
+    def __init__(self, documents=None, eval_mode='', flatten_counts=False,
+                 multiplier=10, sparsifier=-1, max_vocab=500000):
         self.eval_mode = eval_mode
         self.flatten_counts = flatten_counts
+        self.multiplier = multiplier
+        self.sparsifier = sparsifier
+        self.max_vocab = max_vocab
+        self._hash_vectors = None
 
         if isinstance(documents, DocArray):
+            # Should we inherit settings from the DocArray passed in here??
             self.words = list(documents.words)
             self.word_index = dict(documents.word_index)
             self._word_count = ExtendWrap(documents._word_count)
@@ -89,39 +92,13 @@ class DocArray(abc.Sequence):
             self._indices = ExtendWrap(documents._indices)
             self._counts = ExtendWrap(documents._counts)
         else:
-            self.words = []
-            self.word_index = {}
-            self._word_count = ExtendWrap(
-                numpy.zeros(0, dtype=numpy.float64))
-            self._word_count_total = 0
-            self._log_word_count = ExtendWrap(
-                numpy.zeros(0, dtype=numpy.float64))
-            self._ends = ExtendWrap(
-                numpy.zeros(0, dtype=numpy.int64))
-            self._indices = ExtendWrap(
-                numpy.zeros(0, dtype=numpy.int64))
-            self._counts = ExtendWrap(
-                numpy.zeros(0, dtype=numpy.float64))
+            self.empty_index()
 
             if documents is not None:
                 if isinstance(documents, abc.Sequence):
                     self.extend(documents)
                 else:
                     self.extend_iter(documents)
-
-    @classmethod
-    def from_feature_tuple(cls, features):
-        w, wix, wc, wc_total, lwc, ends, indices, counts = features
-        da = cls()
-        da.words = w
-        da.word_index = wix
-        da._word_count = wc
-        da._word_count_total = wc_total
-        da._log_word_count = lwc
-        da._ends = ends
-        da._indices = indices
-        da._counts = counts
-        return da
 
     def __len__(self):
         return len(self._ends)
@@ -139,7 +116,9 @@ class DocArray(abc.Sequence):
             new_index = numpy.array([ix for s, e in zip(starts, ends)
                                      for ix in range(s, e)])
             new_ends = (ends - starts).cumsum()
+
             new = DocArray()
+            new.inherit_settings(self)
 
             new.words = self.words
             new.word_index = self.word_index
@@ -160,8 +139,47 @@ class DocArray(abc.Sequence):
 
     def __add__(self, right):
         left = DocArray(self)
+        left.inherit_settings(self)
         left.extend(right)
         return left
+
+    def inherit_settings(self, docarray):
+        self.eval_mode = docarray.eval_mode
+        self.flatten_counts = docarray.flatten_counts
+        self.multiplier = docarray.multiplier
+        self.sparsifier = docarray.sparsifier
+
+    @property
+    def hash_vectors(self):
+        if self._hash_vectors is None:
+            self._hash_vectors = util.srp_matrix(self.words[:self.max_vocab],
+                                                 self.multiplier,
+                                                 self.sparsifier)
+        return self._hash_vectors
+
+    # Reset the word index. This also empties out the documents, since they
+    # are useless wihtout the word index.
+    def empty_index(self):
+        self.words = []
+        self.word_index = {}
+
+        self._word_count = ExtendWrap(
+            numpy.zeros(0, dtype=numpy.float64))
+        self._word_count_total = 0
+        self._log_word_count = ExtendWrap(
+            numpy.zeros(0, dtype=numpy.float64))
+
+        self.empty_docs()
+
+    # Empty out the docarray, but preserve the word indices and counts
+    # if they exist.
+    def empty_docs(self):
+        self._ends = ExtendWrap(
+            numpy.zeros(0, dtype=numpy.int64))
+        self._indices = ExtendWrap(
+            numpy.zeros(0, dtype=numpy.int64))
+        self._counts = ExtendWrap(
+            numpy.zeros(0, dtype=numpy.float64))
 
     def features(self):
         return (self._ends.array,
@@ -180,15 +198,28 @@ class DocArray(abc.Sequence):
                    for w in [self.words[ix]] * ct]
 
     def add_words(self, words):
-        new = set(words) - self.word_index.keys()
+        new = list(set(words) - self.word_index.keys())
+        ignore = []
+        if len(new) + len(self.words) > self.max_vocab:
+            last_n = self.max_vocab - len(self.words)
+            last_n = last_n if last_n > 0 else 0
+            ignore = new[last_n:]
+            new = new[:last_n]
+
+        old_len = len(self.words)
         if new:
-            new = list(new)
-            old_len = len(self.words)
             for i, w in enumerate(new):
                 self.words.append(w)
                 self.word_index[w] = i + old_len
             self._word_count.extend([0] * len(new))
             self._log_word_count.extend([0] * len(new))
+
+            self._hash_vectors = None
+
+        if ignore:
+            for i, w in enumerate(ignore):
+                self.words.append(w)
+                self.word_index[w] = self.max_vocab - 1
 
     def extend_iter(self, doc_iter, chunksize=10000):
         if isinstance(doc_iter, DocArray):
@@ -263,6 +294,9 @@ class DocArray(abc.Sequence):
             self._indices.extend(indices)
             self._counts.extend(counts)
 
+    def overwrite(self, documents):
+        self.empty_docs()
+        self.extend(documents)
 
 # OK: This word embedding model starts from the assumption that
 # words are types, and that individual instances of words --
@@ -392,11 +426,28 @@ class DocArray(abc.Sequence):
 # cannot for the life of me figure out what I
 # changed.
 
+# For multiprocessing, the following functions must
+# be in the global namespace of this module.
+
+def train_chunk_star(docarray_hash_vectors):
+    docarray, hash_vectors = docarray_hash_vectors
+    return util.train_chunk(docarray, hash_vectors)
+
+def train_chunk_star_sp(docarray_hash_vectors):
+    docarray, hash_vectors = docarray_hash_vectors
+    return util.train_chunk_cy(docarray, hash_vectors)
+
+def train_chunk_multi(slice):
+    util.train_chunk_configurable_scaling(
+        MP_DOC_ARRAY[slice], MP_HASH_VECS,
+        MP_EMBED_OUT, MP_EMBED_BUF,
+        MP_JACOB_OUT, MP_JACOB_BUF,
+        MP_GEOM_SCALE, MP_ARITH_NORM,
+        MP_COSINE_NORM)
+
 class Embedding(object):
-    def __init__(self, docarray=None, multiplier=10, sparsifier=-1):
+    def __init__(self, docarray=None):
         self.docarray = None
-        self.multiplier = multiplier
-        self.sparsifier = sparsifier
         self._erase_on_reset = False
 
         if docarray is None:
@@ -406,19 +457,29 @@ class Embedding(object):
 
     @property
     def n_bits(self):
-        sp = max(self.sparsifier, 0)
-        return 64 * self.multiplier * 2 ** sp
+        sp = max(self.docarray.sparsifier, 0)
+        return 64 * self.docarray.multiplier * 2 ** sp
+
+    @property
+    def hash_vectors(self):
+        return self.docarray.hash_vectors
 
     def append_docarray(self, docarray):
-        if self.docarray:
+        if self.docarray is not None:
             self.docarray.extend(docarray)
         else:
             self.docarray = docarray
-        self.hash_vectors = srp_matrix(self.docarray.words,
-                                       self.multiplier,
-                                       self.sparsifier)
+
         self.hash_iter_vectors = self.hash_vectors.copy()
         self._new_embedding()
+
+    def overwrite_docarray(self, docarray):
+        if not self.docarray:
+            self.append_docarray(docarray)
+        else:
+            self.docarray.overwrite(docarray)
+            self._extend_embedding()
+            self.hash_iter_vectors = self.hash_vectors.copy()
 
     def _new_embedding(self):
         emb, buf = _buffered_array(self.hash_vectors.shape,
@@ -432,6 +493,14 @@ class Embedding(object):
         jac[:] = 0
         self.jacobian_vector = jac
         self.jacobian_vector_buffer = jac_buf
+
+    def _extend_embedding(self):
+        old_emb = self.embed_vectors
+        old_jac = self.jacobian_vector
+
+        self._new_embedding()
+        self.embed_vectors[:len(old_emb)] = old_emb
+        self.jacobian_vector[:len(old_jac)] = old_jac
 
     def step_embedding(self):
         self.hash_iter_vectors = self._sparsify_embedding()
@@ -457,10 +526,10 @@ class Embedding(object):
 
         if euclidean:
             def dist(w):
-                return euclidean_dist(self.get_vec(w), word_vec)
+                return util.euclidean_dist(self.get_vec(w), word_vec)
         else:
             def dist(w):
-                return 1 - cosine_sim(self.get_vec(w), word_vec)
+                return 1 - util.cosine_sim(self.get_vec(w), word_vec)
 
         return dist
 
@@ -485,11 +554,9 @@ class Embedding(object):
         if use_embedding:
             # This tries to transform the embedding into a new semi-random
             # projection. In practice, it doesn't seem to make much difference.
-            return resample_vectors(self.embed_vectors)
+            return util.resample_vectors(self.embed_vectors)
         else:
-            return srp_matrix(self.docarray.words,
-                              self.multiplier,
-                              self.sparsifier)
+            return self.hash_vectors
 
     def _svd_prep(self, U, s):
         return U[:, :len(s)], numpy.diag(s)
@@ -540,6 +607,7 @@ class Embedding(object):
 
     def _eigen_embedding(self):
         ev = self.embed_vectors
+        ev = ev * ((ev * ev).sum(axis=1) ** 0.5)  # Cosine distance norm
         sample = numpy.random.choice(len(ev), size=ev.shape[1] * 20)
         ev_sample = (ev[sample])
 
@@ -563,12 +631,7 @@ class Embedding(object):
 
     def train(self):
         self._reset_embedding()
-        embed = train_chunk(self.docarray, self.hash_iter_vectors)
-        self.embed_vectors += embed
-
-    def train_sp(self):
-        self._reset_embedding()
-        embed = train_chunk_cy(self.docarray, self.hash_iter_vectors)
+        embed = util.train_chunk(self.docarray, self.hash_iter_vectors)
         self.embed_vectors += embed
 
     def _chunkparams(self, embed_shape):
@@ -578,7 +641,7 @@ class Embedding(object):
 
         n_words, n_dims = embed_shape
         min_chunksize = 1000
-        max_chunksize = 2 ** 24 // n_dims
+        max_chunksize = 2 ** 22 // n_dims
         n_docs = len(self.docarray)
         n_procs = multiprocessing.cpu_count()
         chunksize = n_docs // n_procs + 1
@@ -595,6 +658,7 @@ class Embedding(object):
 
     def train_multi(self,
                     with_jacobian=False,
+                    cosine_norm=False,
                     arithmetic_norm=False,
                     geometric_scaling=1):
         self._reset_embedding()
@@ -604,7 +668,7 @@ class Embedding(object):
         global MP_DOC_ARRAY, MP_HASH_VECS
         global MP_EMBED_OUT, MP_EMBED_BUF
         global MP_JACOB_OUT, MP_JACOB_BUF
-        global MP_GEOM_SCALE, MP_ARITH_NORM
+        global MP_GEOM_SCALE, MP_ARITH_NORM, MP_COSINE_NORM
 
         MP_DOC_ARRAY = self.docarray
         MP_HASH_VECS = self.hash_iter_vectors
@@ -614,6 +678,7 @@ class Embedding(object):
         MP_JACOB_BUF = self.jacobian_vector_buffer
         MP_GEOM_SCALE = geometric_scaling
         MP_ARITH_NORM = arithmetic_norm
+        MP_COSINE_NORM = cosine_norm
 
         slices = (slice(i, i + chunksize)
                   for i in range(0, len(self.docarray), chunksize))
@@ -621,14 +686,14 @@ class Embedding(object):
         n_docs = len(self.docarray)
         n_chunks = n_docs // chunksize + 1
         tenth = max(n_chunks // 10, 1)
-        print("Starting multiprocessing:")
+        print("  Starting multiprocessing:")
         print("    {} processes".format(n_procs))
         print("    {} tasks per chunk".format(chunksize))
         print("    ~{} chunks".format(n_chunks))
         print("    completed: 0... ", end='', flush=True)
 
         with multiprocessing.Pool(processes=n_procs,
-                                  maxtasksperchild=10) as pool:
+                                  maxtasksperchild=3) as pool:
             chunk_ct = 0
             for result in pool.imap_unordered(train_chunk_multi, slices):
                 chunk_ct += 1
@@ -690,34 +755,30 @@ class Embedding(object):
         #       and are merged with their unannotated versions or
         #       dropped from the final output.
         words = [w for w in words
-                 if tot[wix[w]] >= mincount and not w.endswith('_')]
+                 if tot[wix[w]] >= mincount and
+                 not w.endswith('_') and
+                 wix[w] != (self.docarray.max_vocab - 1)]
 
-        vecs = [embed_vectors[wix[w]][:truncate] for w in words]
-
-        # Experiment: what happens when we randomly select dimensions
-        # instead of always truncating dimensions with low signular values?
-        # (Only applicable when _eigen_embedding has been called.)
-        # Unfortunately, nothing interesitng happened.
-
-        # vec_len = len(embed_vectors[wix[next(iter(wix))]])
-        # random_sample = random.sample(range(vec_len), truncate)
-        # vecs = [embed_vectors[wix[w]][random_sample] for w in words]
+        vecs = (embed_vectors[wix[w]][:truncate] for w in words)
+        sample_vec = embed_vectors[wix[words[0]]][:truncate]
+        print('Final vector size: {} dimensions'.format(len(sample_vec)))
 
         if include_annotated:
             # Concatenate the vectors for annotated and
             # unannotated versions of each word.
             words_ = [w + '_' for w in words]
-            vecs_ = [embed_vectors[wix[w_]][:truncate] for w_ in words_]
-            vecs = [numpy.concatenate([v, v_])
-                    for v, v_ in zip(vecs, vecs_)]
+            vecs_ = (embed_vectors[wix[w_]][:truncate] for w_ in words_)
+            vecs = (numpy.concatenate([v, v_])
+                    for v, v_ in zip(vecs, vecs_))
 
-        rows = ['{} {}\n'.format(w, ' '.join(str(v) for v in vec))
-                for w, vec in zip(words, vecs)]
+        rows = ('{} {}\n'.format(w, ' '.join(str(v) for v in vec))
+                for w, vec in zip(words, vecs))
 
-        print('Final vector size: {} dimensions'.format(len(vecs[0])))
         with open(filename, 'w', encoding='utf-8') as op:
             for r in rows:
                 op.write(r)
+
+        return dict(zip(words, vecs))
 
     def save_vocab(self, filename, mincount=10):
         tot = self.docarray._word_count
@@ -728,449 +789,59 @@ class Embedding(object):
 
         # NOTE: See note above.
         words = [w for w in words
-                 if tot[wix[w]] >= mincount and not w.endswith('_')]
+                 if tot[wix[w]] >= mincount and
+                 not w.endswith('_') and
+                 wix[w] != (self.docarray.max_vocab - 1)]
+
         rows = ['{} {}\n'.format(w, tot[wix[w]]) for w in words]
         with open(filename, 'w', encoding='utf-8') as op:
             for r in rows:
                 op.write(r)
 
-    def train_test_chunk_sp(self):
-        """
-        As of 2017-10-22, this passes consistently.
-        """
-        hash_vectors = self.hash_iter_vectors
-        chunksize = 2000
-        chunks = ((self.docarray[i:i + chunksize], hash_vectors)
-                  for i in range(0, len(self.docarray), chunksize))
-
-        error_records = []
-        for ch_ix, chunk in enumerate(chunks):
-            r1 = train_chunk_star(chunk)
-            r1 = r1[r1.sum(axis=1) > 0]
-            r2 = train_chunk_star_sp(chunk)
-            r2, r2ix = r2
-            try:
-                assert numpy.allclose(r1, r2)
-            except AssertionError:
-                tol = 1e-10
-                abs_error = numpy.abs(r1 - r2)
-                bad_errors = abs_error[(abs_error > tol).nonzero()]
-                bad_error_ratio = bad_errors.shape[0]
-                bad_error_ratio /= r1.shape[0] * r1.shape[1]
-
-                print()
-                print("Fraction of bad errors (> {}):".format(tol))
-                print(bad_error_ratio)
-                print("Mean bad error:")
-                print(bad_errors.mean())
-                print("Median bad error:")
-                print(numpy.median(bad_errors))
-                print("Max bad error:")
-                print(bad_errors.max())
-                print()
-                if bad_error_ratio > 1e-5:
-                    error_records.append((ch_ix, bad_error_ratio))
-
-            self.embed_vectors[r2ix] += r2
-
-        if error_records:
-            raise RuntimeError("_train_test_chunk_sp: test failed")
-        else:
-            print('All chunkwise training tests passed.')
-
-
-# ###########################
-# #### Utility Functions ####
-# ###########################
-
-def sparsify_rows(matrix, iters=1):
-    for i in range(iters):
-        left = matrix[:, 0::2]
-        right = matrix[:, 1::2]
-
-        rows, cols = matrix.shape
-        cols *= 2
-
-        out = numpy.zeros((rows, cols), dtype=numpy.uint8)
-        out[:, 0::4] = left * (1 - right)
-        out[:, 1::4] = (1 - left) * right
-        out[:, 2::4] = (1 - left) * (1 - right)
-        out[:, 3::4] = left * right
-
-        matrix = out
-
-    return matrix
-
-# This is my quick-and-dirty implementation of what Ben Schmidt calls
-# "Stable Random Projection." I'm not sure it's totally correct, but
-# the idea is from him.
-def srp_matrix(words, multiplier, sparsifier=-1):
-    hashes = [list(map(hash, ['{}_{}'.format(w, i) for w in words]))
-              for i in range(multiplier)]
-
-    # Given a `multipier` value of 5, `hashes` is really a Vx5
-    # array of 8-byte integers, where V is the vocabulary size.
-
-    hash_arr = numpy.array(hashes, dtype=numpy.int64)
-
-    # But we could also think of it as an array of bytes,
-    # where every word is represented by 40 bytes...
-
-    hash_arr = hash_arr.view(dtype=numpy.uint8)
-
-    # ...or even as an array of bits, where every word is represented
-    # by 320 bits...
-
-    hash_arr = numpy.unpackbits(hash_arr.ravel()).reshape(-1, 64 * multiplier)
-
-    if sparsifier >= 0:
-        # ...or even as an array of bits, where every word is represented
-        # by 640 bits, where pairs of bits are mapped to four bits with one
-        # positive value, which ensures greater sparsity, which is what
-        # sparsify_rows does if `sparsifier` is greater than 1.
-        out = sparsify_rows(hash_arr, sparsifier).astype(numpy.float64)
-    else:
-        out = hash_arr.astype(numpy.float64) * 2 - 1
-
-    return out
-
-def resample_vectors(vecs):
-    new_vecs = numpy.empty(vecs.shape, dtype=vecs.dtype)
-    for i, v in enumerate(vecs):
-        bins = numpy.zeros(v.shape[0] + 1)
-        bins[1:] = v.cumsum()
-        binsample = numpy.random.random(len(bins) * 10) * bins.max()
-        bincount = numpy.histogram(binsample, bins)[0]
-        new_vecs[i, :] = bincount > numpy.median(bincount)
-    return numpy.asarray(new_vecs, dtype=numpy.uint8)
-
-def resample_vectors_median(vecs):
-    new_vecs = vecs.copy()
-    new_vecs_median = numpy.median(new_vecs, axis=1)[:, None]
-    new_vecs_std = new_vecs.std(axis=1)[:, None]
-    new_vecs[:] = new_vecs > (new_vecs_median + new_vecs_std * 1.5)
-    return numpy.asarray(new_vecs, dtype=numpy.uint8)
-
-def word_doc_matrix(words, documents):
-    index = {w: i for i, w in enumerate(words)}
-    mat = numpy.zeros((len(words), len(documents)), dtype=numpy.float64)
-    for j, doc in enumerate(documents):
-        doc_ix = [index[w] for w in doc]
-        ct = numpy.bincount(doc_ix)
-        mat[:len(ct), j] = ct
-    return mat
-
-def cosine_sim(a, b):
-    norm = ((a @ a) * (b @ b)) ** 0.5
-    return (a @ b) / norm if norm != 0 else 0
-
-def cosine_sim_to(word, vec_dict):
-    if isinstance(word, str):
-        vec = vec_dict[word]
-    else:
-        vec = word
-
-    def dist(w):
-        return cosine_sim(vec_dict[w], vec)
-    return dist
-
-def euclidean_dist(a, b):
-    d = a - b
-    return (d @ d) ** 0.5
-
-def euclidean_dist_to(word, vec_dict):
-    if isinstance(word, str):
-        vec = vec_dict[word]
-    else:
-        vec = word
-
-    def dist(w):
-        return euclidean_dist(vec_dict[w], vec)
-    return dist
-
-def train_chunk_star(docarray_hash_vectors):
-    docarray, hash_vectors = docarray_hash_vectors
-    return train_chunk(docarray, hash_vectors)
-
-def train_chunk_star_sp(docarray_hash_vectors):
-    docarray, hash_vectors = docarray_hash_vectors
-    return train_chunk_cy(docarray, hash_vectors)
-
-# This ridiculous series of functions is required because
-# multiprocessing still can't sensibly handle dynamic function
-# generation.
-
-def train_chunk_multi(slice):
-    train_chunk_configurable_scaling(
-        MP_DOC_ARRAY[slice], MP_HASH_VECS,
-        MP_EMBED_OUT, MP_EMBED_BUF,
-        MP_JACOB_OUT, MP_JACOB_BUF,
-        MP_GEOM_SCALE, MP_ARITH_NORM)
-
-# ########################
-# #### CORE FUNCTIONS ####
-# ########################
-
-def train_chunk(docarray, hash_vectors):
-    embed_vectors = numpy.zeros(hash_vectors.shape)
-    for indices, counts, totals, log_totals in docarray:
-        # Documents with only one word do us no good.
-        if counts.sum() < 2:
-            continue
-
-        embed = embed_hess(counts,
-                           log_totals,
-                           totals,
-                           hash_vectors[indices, :])
-
-        # Update embeddings for the given words:
-        embed_vectors[indices, :] += embed
-    return embed_vectors
-
-def embed_hess(dc_vec, wc_vec, wc_vec_raw, hv):
-    # Create hessian...
-    hess = block_logspace_hessian_sp(dc_vec, wc_vec)
-    len_doc = dc_vec.sum()
-
-    # Take geometric mean w.r.t sentence length, the
-    # arithmetic mean w.r.t. sentence length, and the
-    # arithmeic mean w.r.t word token count. I don't
-    # know how to justify these moves theoretically.
-    # My best shot is that these "whiten" the hessian,
-    # causing it to approximate something more ortho-
-    # normal. They certainly lead to better results
-    # in practice, because they ensure that longer
-    # sentences don't get more weight than shorter
-    # ones and that common words don't get more
-    # weight than rare ones.
-    hess **= 1 / len_doc
-    hess /= len_doc
-    hess /= (wc_vec_raw[:, None] + 1)
-
-    # This corresponds to the tests described as
-    # "a bit sloppy" in sparsehess.pyx. There's a
-    # chance these have a significant negative
-    # effect on dimension reduction; more testing
-    # is needed to verify that this isn't an
-    # issue.
-    hess[~numpy.isfinite(hess)] = 0
-
-    # Project hessian into hashed vector space...
-    return hess @ hv
-
-def zero_if_nan(arr_2d, msg=None):
-    if numpy.isnan(arr_2d).any():
-        if msg is not None:
-            print(msg)
-        return numpy.nan_to_num(arr_2d)
-    else:
-        return arr_2d
-
-def block_hessian(pow_vector, x_vector):
-    """
-    Take a single polynomial term and calculate the hessian for that term
-    at a given point. The term is represented as a sequence of powers, and
-    the point is represented as a sequence of values corresponding to each
-    given power's dimension. For example, this will calculate the hessian
-    matrix of the term x ^ 2 * y * z at the point (x, y, z) = (2, 3, 3):
-
-        block_hessian([2, 1, 1], [2, 3, 3])
-
-    For sparse polynomials of many variables, this allows us to calculate
-    the hessian efficiently, using only terms with nonzero weights, and
-    calculating term values using only those dimensions with nonzero
-    powers. The resulting blocks can be summed together to produce a
-    NxN hessian for very large N.
-
-    For additional efficiency, this calculates the hessian in the
-    following form:
-
-        H(P, X, i, j) = P * M * K
-            P = Pi[k](X_k ^ P_k)
-            M = P_i * P_j / (X_i * X_j)
-            K = (P_i - kdel(i, j)) / P_i
-
-    Here, Pi is the usual product operator, kdel is the Kronecker delta,
-    and i and j are row and column indices. The P term can be calcluated
-    just once and reused for all values of i and j. The M term can be
-    calculated using efficient matrix operations. And the K term is equal
-    to 1 except for values along the diagonal, and so can be applied just
-    to the diagonal values of the output of the M term.
-
-    To see that this calculates the hessian matrix, observe that for
-    any given i not equal to j, it evaluates to:
-
-        P_i * X_i ^ P_i / X-i * P_j * X_j ^ P_j / X_j
-            * Pi[k != i, k !=j](X_k ^ P_k)
-
-    The first part of which simplifies to the power rule for partial
-    derivatives over two different dimensions:
-
-        P_i * X_i ^ (P_i - 1) * P_j * X_j ^ (P_j - 1) * ...
-
-    When i is equal to j, it evaluates to:
-
-        P_i * (P_i - 1) * X_i ^ P_i / (X_i * X_i)
-            * Pi[k != i](X_k ^ P_k)
-
-    The first part of which simplifies to the power rule for second
-    partial derivatives:
-
-        P_i * (P_i - 1) * X_i ^ (P_i - 2) ...
-
-    The resulting matrix is thus the matrix of all combinations of
-    all second derivatives of the input polynomial.
-    """
-
-    P = numpy.product(x_vector ** pow_vector)
-    M_num = pow_vector[:, None] * pow_vector[None, :]
-    M_den = x_vector[:, None] * x_vector[None, :]
-    K = (pow_vector - 1) / pow_vector
-
-    P *= M_num / M_den
-    P[numpy.diag_indices_from(P)] *= K
-
-    return zero_if_nan(P, "block_hessian: nan result in hessian")
-
-def block_logspace_hessian(pow_vector, x_vector):
-    """
-    Identical to `block_hessian` but calculated in log space.
-    """
-
-    x_vector_log = numpy.log(x_vector)
-    pow_vector_log = numpy.log(pow_vector)
-
-    M = pow_vector_log[:, None] + pow_vector_log[None, :]
-    M -= x_vector_log[:, None]
-    M -= x_vector_log[None, :]
-
-    P = (x_vector_log * pow_vector).sum() + M
-    P = numpy.exp(P)
-
-    # The zero mutliply here is cleaner in linear space.
-    K = (pow_vector - 1) / pow_vector
-    P[numpy.diag_indices_from(P)] *= K
-
-    return zero_if_nan(P, "block_logspace_hessian: nan result in hessian")
-
-def estimated_hessian(ps, xs, delta=1e-4):
-    def poly_eval(ps, xs):
-        return numpy.prod(xs ** ps)
-
-    def est_at(dim, dim2=None):
-        if dim2 is None:
-            p_diff = xs.copy()
-            n_diff = xs.copy()
-            p_diff[dim] += delta
-            n_diff[dim] -= delta
-
-            out = poly_eval(ps, p_diff)
-            out -= 2 * poly_eval(ps, xs)
-            out += poly_eval(ps, n_diff)
-            out /= delta * delta
-            return out
-        else:
-            dim1 = dim
-            p_p_diff = xs.copy()
-            p_n_diff = xs.copy()
-            n_p_diff = xs.copy()
-            n_n_diff = xs.copy()
-
-            p_p_diff[dim1] += delta
-            p_p_diff[dim2] += delta
-            p_n_diff[dim1] += delta
-            p_n_diff[dim2] -= delta
-            n_p_diff[dim1] -= delta
-            n_p_diff[dim2] += delta
-            n_n_diff[dim1] -= delta
-            n_n_diff[dim2] -= delta
-
-            out = poly_eval(ps, p_p_diff)
-            out += poly_eval(ps, n_n_diff)
-            out -= poly_eval(ps, p_n_diff)
-            out -= poly_eval(ps, n_p_diff)
-            out /= delta * delta * 4
-            return out
-
-    result = numpy.zeros((len(xs), len(xs)), dtype=xs.dtype)
-    for i in range(len(xs)):
-        for j in range(len(xs)):
-            if i == j:
-                result[i, i] = est_at(i)
-            else:
-                result[i, j] = est_at(i, j)
-    return result
-
-def test_hessians():
-    n_vars = 20
-    n_tests = 100
-    PS = numpy.random.randint(1, 5, size=(n_tests, n_vars))
-    PS = numpy.asarray(PS, dtype=numpy.float64)
-    XS = numpy.random.random((n_tests, n_vars)) * 3
-    delta = 1e-6
-
-    failed = 0
-    for ps, xs in zip(PS, XS):
-        bh_result = block_hessian(ps, xs)
-        blh_result = block_logspace_hessian(ps, xs)
-        blhs_result = block_logspace_hessian_sp(ps, xs)
-        est_result = estimated_hessian(ps, xs)
-
-        test_versions = ((bh_result, "block_hessian"),
-                         (blh_result, "block_logspace_hessian"),
-                         (blhs_result, "block_logspace_hessian_sp"))
-
-        for res, res_name in test_versions:
-            try:
-                assert numpy.allclose(est_result, res)
-            except AssertionError:
-                err = est_result - res
-                err_abs = numpy.abs(err)
-                abs_err_prop = err_abs.sum().sum() / est_result.sum().sum()
-
-                est_result_nz = est_result.copy()
-                est_result_nz[est_result == 0] = 1
-                err_prop_mat = err_abs / est_result_nz
-                err_max = err_prop_mat.max()
-                err_median = numpy.median(err_prop_mat)
-                worst_errors = (err_abs / est_result_nz) > (abs_err_prop * 5)
-                worst_errors[est_result == 0] = False
-                if abs_err_prop > (delta * 100):
-                    print()
-                    print("Hessian test failed for {}...".format(res_name))
-                    print("Absolute proportional error: ", abs_err_prop)
-                    print("Max error: ", err_max)
-                    print("Median error: ", err_median)
-                    if worst_errors.any():
-                        loc = worst_errors.nonzero()
-                        table = zip(est_result[worst_errors],
-                                    res[worst_errors],
-                                    loc[0],
-                                    loc[1])
-                        print("Worst error values -- ")
-                        print("      "
-                              "  Estimated value   "
-                              "  Calculated value  "
-                              "  Difference        "
-                              "  at Row, Col       ")
-                        table_fmt = (
-                            "  {: 18.10f}"
-                            "  {: 18.10f}"
-                            "  {: 18.10f}"
-                            "        {}")
-                        for est, cal, r, c in table:
-                            print(table_fmt.format(
-                                est, cal, abs(est - cal), str((r, c))
-                            ))
-                    failed += 1
-
-    if failed:
-        print()
-        print("{}/{} tests failed.".format(failed,
-                                           n_tests * len(test_versions)))
-        print()
-        print("This probably doesn't indicate a major problem unless the")
-        print("absolute proportional error is higher than 0.05, or is higher")
-        print("than 0.001 for more than twenty or thirty tests.")
-    else:
-        print("All hessian tests passed!")
+# This is dead code and should be removed eventually. But I may
+# want to reuse it to create a new set of tests, so I'm not
+# deleting it yet.
+
+#     def train_test_chunk_sp(self):
+#         """
+#         As of 2017-10-22, this passes consistently.
+#         """
+#         hash_vectors = self.hash_iter_vectors
+#         chunksize = 2000
+#         chunks = ((self.docarray[i:i + chunksize], hash_vectors)
+#                   for i in range(0, len(self.docarray), chunksize))
+#
+#         error_records = []
+#         for ch_ix, chunk in enumerate(chunks):
+#             r1 = train_chunk_star(chunk)
+#             r1 = r1[r1.sum(axis=1) > 0]
+#             r2 = train_chunk_star_sp(chunk)
+#             r2, r2ix = r2
+#             try:
+#                 assert numpy.allclose(r1, r2)
+#             except AssertionError:
+#                 tol = 1e-10
+#                 abs_error = numpy.abs(r1 - r2)
+#                 bad_errors = abs_error[(abs_error > tol).nonzero()]
+#                 bad_error_ratio = bad_errors.shape[0]
+#                 bad_error_ratio /= r1.shape[0] * r1.shape[1]
+#
+#                 print()
+#                 print("Fraction of bad errors (> {}):".format(tol))
+#                 print(bad_error_ratio)
+#                 print("Mean bad error:")
+#                 print(bad_errors.mean())
+#                 print("Median bad error:")
+#                 print(numpy.median(bad_errors))
+#                 print("Max bad error:")
+#                 print(bad_errors.max())
+#                 print()
+#                 if bad_error_ratio > 1e-5:
+#                     error_records.append((ch_ix, bad_error_ratio))
+#
+#             self.embed_vectors[r2ix] += r2
+#
+#         if error_records:
+#             raise RuntimeError("_train_test_chunk_sp: test failed")
+#         else:
+#             print('All chunkwise training tests passed.')

@@ -1,98 +1,12 @@
 import os
-import re
-import string
 import argparse
 import subprocess
-import numpy
-from itertools import islice
+from itertools import islice, chain
 
 from docembed import DocArray
 from docembed import Embedding
-from docembed import test_hessians
 
-# A heisenbug occurred here. `set` produced random orderings of
-# punctuation characters. Some of those orderings produced regexes
-# that did bizarre things. This only happened occasionally and when
-# I attempted to recreate the bug, everything behaved as normal.
-# Only when I saw that the characters in `_punct` were in a
-# different order each time did I understand what I had done.
-# In Python 3, `hash` was updated to use a more cryptographically
-# secure hash function, and to seed it anew every time a new
-# Python process is started. Thus bad orderings appear only
-# occasionally and unpredictably.
-_punct = '\\'.join(sorted(set(string.punctuation) - set('.')))
-_punct += '\\“\\”\\—\\…'
-_punct_rex = re.compile('[{}]'.format(_punct))
-def load_and_split(txt):
-    sents = _punct_rex.sub('', txt.lower()).split('.')
-    sents = [s.split() for s in sents]
-    return sents
-
-
-_allpunct_rex = re.compile('[{}]'.format(_punct + '\\.'))
-def load_and_make_windows(txt, window_size=15):
-    sents = _allpunct_rex.sub('', txt.lower()).split()
-    sents = [sents[i: i + window_size]
-             for i in range(0, len(sents), window_size)]
-    return sents
-
-def random_window_gen(mean, std, block_size=1000):
-    while True:
-        for v in numpy.random.normal(mean, std, block_size):
-            yield int(v)
-
-def load_and_make_random_windows(txt, window_size=15, reps=1):
-    words = _allpunct_rex.sub('', txt.lower()).split()
-    for i in range(reps):
-        start = 0
-        for size in random_window_gen(window_size, window_size // 2):
-            if size < 3:
-                continue
-            end = start + size
-            yield words[start:end]
-
-            start = end
-            if start >= len(words):
-                break
-
-
-# Here, "annotation" means creating overlapping windows,
-# where very course-grained word position information is
-# retained by prepending an underscore to the words in
-# one half of the sentence and leaving the words in the
-# second half unchanged.
-def load_and_annotate_windows(txt, window_size=15):
-    split = _allpunct_rex.sub('', txt.lower()).split()
-    sents = (split[i: i + window_size]
-             for i in range(0, len(split), window_size // 2))
-    annotated = []
-    for s in sents:
-        s_ = [w + '_' for w in s]
-        s_head = s[:window_size // 2]
-        s_tail = s[window_size // 2:]
-        s_head_ = s_[:window_size // 2]
-        s_tail_ = s_[window_size // 2:]
-        annotated.append(s_head + s_tail_)
-        annotated.append(s_head_ + s_tail)
-    return annotated
-
-def load(fn, window_size=15, annotate=True):
-    with open(fn) as ip:
-        txt = ip.read()
-    if '.' in txt:
-        return load_and_split(txt)
-    elif annotate:
-        return load_and_annotate_windows(txt, window_size)
-    else:
-        # return load_and_make_windows(txt, window_size)
-        return load_and_make_random_windows(txt, window_size)
-
-def group(it, n):
-    it = iter(it)
-    g = tuple(islice(it, n))
-    while g:
-        yield g
-        g = tuple(islice(it, n))
+import util
 
 def demo_out(emb, iteration, testword=None):
     print()
@@ -205,14 +119,12 @@ def parse_args():
         help='A directory containing text files for training a model.'
     )
     parser.add_argument(
-        '-j',
         '--with-jacobian',
         action='store_true',
         default=False,
         help='Calculate the jacobian for use as a normalizing factor.'
     )
     parser.add_argument(
-        '-r',
         '--arithmetic-norm',
         action='store_true',
         default=False,
@@ -243,7 +155,14 @@ def parse_args():
         'window, and GloVe does not randomly vary the window size.'
     )
     parser.add_argument(
-        '-a',
+        '-r',
+        '--window-sigma',
+        type=float,
+        default=0,
+        help='The standard distribution of the window size distribution, '
+        'as a fraction of the window size. Defaults to 0.5'
+    )
+    parser.add_argument(
         '--annotate',
         action='store_true',
         default=False,
@@ -321,6 +240,22 @@ def parse_args():
         'dimensions. By default, no dimension reduction is performed.'
     )
     parser.add_argument(
+        '-C',
+        '--cosine-norm',
+        action='store_true',
+        default=False,
+        help='Normalize results using cosine distance after every batch.'
+    )
+    parser.add_argument(
+        '-V',
+        '--max-vocab',
+        type=int,
+        default=600000,
+        help='The maximum number of terms to include in the vocabulary. Words '
+        'are added on a "first-come-first-serve" basis until this number is '
+        'reached. Defaults to 600,000.'
+    )
+    parser.add_argument(
         '--test-hessian',
         action='store_true',
         default=False,
@@ -348,6 +283,7 @@ def parse_args():
         default=False,
         help='Execute the GloVe evaluation script on saved vectors.'
     )
+
     parser.add_argument(
         '-v',
         '--eval-mode',
@@ -368,42 +304,97 @@ def parse_args():
 
     return args
 
+def doc_iter(textdir, window_size, window_sigma,
+             annotate, n_windows):
+    textfiles = sorted(os.path.join(textdir, f) for f in os.listdir(textdir))
+    alldocs = (sent for fn in textfiles
+               for sent in util.load(fn,
+                                     window_size=window_size,
+                                     window_sigma=window_sigma,
+                                     annotate=annotate))
+    if n_windows > 0:
+        return islice(alldocs, n_windows)
+    else:
+        return alldocs
+
+def batch_doc_iter(textdir, window_size, window_sigma,
+                   annotate, n_windows, batchsize):
+    docs = doc_iter(textdir, window_size, window_sigma, annotate, n_windows)
+    end = object()
+    while True:
+        batch = islice(docs, batchsize)
+
+        # Peek ahead to see if the batch is empty...
+        next_item = next(batch, end)
+        if next_item is end:
+            return
+        else:
+            yield chain((next_item,), batch)
+
+def main_test_train(args):
+    textdir = args.text_directory
+    alldocs = doc_iter(textdir,
+                       args.window_size,
+                       args.window_sigma,
+                       args.annotate,
+                       args.number_of_windows)
+    alldocs = DocArray(islice(alldocs, 100000))
+    emb = Embedding(alldocs)
+    print('Testing a {}-dimension base embedding.'.format(emb.n_bits))
+    emb.train_test_chunk_sp()
+
 def main(args):
     textdir = args.text_directory
-
-    textfiles = sorted(os.path.join(textdir, f) for f in os.listdir(textdir))
-    alldocs = (sent
-               for fn in textfiles
-               for sent in load(fn,
-                                window_size=args.window_size,
-                                annotate=args.annotate))
-    if args.number_of_windows > 0:
-        alldocs = islice(alldocs, args.number_of_windows)
-
-    alldocs = DocArray(alldocs,
-                       eval_mode=args.eval_mode,
-                       flatten_counts=args.flatten_counts)
-    emb = Embedding(alldocs,
-                    multiplier=args.hash_vector_multiplier,
-                    sparsifier=args.hash_vector_sparsifier)
+    emb = Embedding(DocArray(eval_mode=args.eval_mode,
+                             flatten_counts=args.flatten_counts,
+                             multiplier=args.hash_vector_multiplier,
+                             sparsifier=args.hash_vector_sparsifier,
+                             max_vocab=args.max_vocab))
 
     print('Creating a {}-dimension base embedding.'.format(emb.n_bits))
 
-    if args.test_train_chunk:
-        emb.train_test_chunk_sp()
-    else:
-        main_train(emb, args)
+    # print('Doc examples:')
+    # examples = doc_iter(textdir, args.window_size,
+    #                     args.window_sigma, args.annotate, 10)
+    # for i in range(10):
+    #     print(next(examples))
 
-def main_train(emb, args):
-    # possibly my dimension reduction woes are arising because we
-    # must complete at least two iterations for the SVD to produce
-    # useful results...
     n_iters = args.number_of_iterations
     for i in range(n_iters):
         print('Iteration {}...'.format(i))
-        emb.train_multi(with_jacobian=args.with_jacobian,
-                        arithmetic_norm=args.arithmetic_norm,
-                        geometric_scaling=args.geometric_scaling)
+        if i > 0:
+            emb.step_embedding()
+
+        n_words = 0
+
+        batch_size = 350000
+        batches = batch_doc_iter(textdir,
+                                 args.window_size,
+                                 args.window_sigma,
+                                 args.annotate,
+                                 args.number_of_windows,
+                                 batch_size)
+
+        for batch_n, batch in enumerate(batches):
+            print(' Batch {}...'.format(batch_n))
+
+            emb.overwrite_docarray(batch)
+            emb.train_multi(with_jacobian=args.with_jacobian,
+                            cosine_norm=args.cosine_norm,
+                            arithmetic_norm=args.arithmetic_norm,
+                            geometric_scaling=args.geometric_scaling)
+
+            n_words += batch_size * args.window_size
+            print(' {} tokens processed'.format(n_words))
+            if batch_n and not batch_n % (300 // args.window_size):
+                emb.save_vectors('vectors.txt',
+                                 mincount=args.save_mincount,
+                                 truncate=None,
+                                 include_annotated=False)
+                emb.save_vocab('vocab.txt', mincount=args.save_mincount)
+                if args.evaluate:
+                    subprocess.run(['python', 'eval/python/evaluate.py'])
+
         if args.demo:
             demo_out(emb, i)
 
@@ -422,11 +413,23 @@ def main_train(emb, args):
     if args.evaluate:
         subprocess.run(['python', 'eval/python/evaluate.py'])
 
+    # Feature selection expiriments:
+
+    # selection_sample = doc_iter(textdir,
+    #                             args.window_size,
+    #                             args.window_sigma,
+    #                             False,
+    #                             100000)
+
+    # util.select_vectors(selection_sample, emb, 4)
+
 
 if __name__ == '__main__':
     args = parse_args()
     if args.test_hessian:
         print("running hessian tests")
-        test_hessians()
+        util.test_hessians()
+    elif args.test_train_chunk:
+        main_test_train(args)
     else:
         main(args)

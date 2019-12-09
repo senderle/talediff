@@ -168,105 +168,6 @@ cdef void cy_train_chunk_combined(
 @cython.boundscheck(False)
 @cython.cdivision(True)
 @cython.wraparound(False)
-cdef void cy_train_chunk_configurable(
-        long[:] ends,
-        long[:] indices,
-        double[:] counts,
-        double[:] totals,
-        double[:] log_totals,
-        double[:] jacobian,
-        double[:, :] embed_vecs,
-        double[:, :] hash_vecs,
-        int arithmetic_norm,
-        int geometric_norm) nogil:
-
-    # Memorably named temp variables.
-    cdef double len_doc_recip = 0
-    cdef double poly_pow = 0
-    cdef double jac_i = 0
-    cdef double jac_i_norm = 0
-    cdef double counts_i = 0
-    cdef double totals_i = 0
-    cdef double log_totals_i = 0
-    cdef double hess_i_j = 0
-    cdef double embed_dot = 0
-
-    # Boundaries and index variables.
-    cdef long n_docs = ends.shape[0]
-    cdef long start = 0
-    cdef long end = 0
-    cdef long hess_size = 0
-    cdef long embed_size = hash_vecs.shape[1]
-    cdef long i, j, k, w_i, w_j, doc_ix
-
-    # This performs almost the same operation as the above function
-    # `cy_train_chunk_jacobian`, but provides several configurable
-    # behaviors. Notes are omitted entirely; for documentation, see
-    # comments to above functions.
-
-    for doc_ix in range(n_docs):
-        end = ends[doc_ix]
-        hess_size = end - start
-
-        len_doc_recip = 0
-        for i in range(hess_size):
-            len_doc_recip += counts[start + i]
-
-        if len_doc_recip < 2:
-            continue
-
-        len_doc_recip = 1 / len_doc_recip
-
-        poly_pow = 0
-        for i in range(hess_size):
-            poly_pow = poly_pow + log(log_totals[start + i]) * counts[start + i]
-
-        for i in range(hess_size):
-            w_i = indices[start + i]
-            counts_i = counts[start + i]
-            totals_i = totals[start + i]
-            log_totals_i = log_totals[start + i]
-
-            jac_i = (poly_pow +
-                     log(counts_i) -
-                     log(log_totals_i))
-
-            # Normalize both the jacobian and the hessian, or neither.
-            if geometric_norm > 0:
-                # Multiplying because we're still in log space.
-                jac_i_norm = jac_i * len_doc_recip
-            else:
-                jac_i_norm = jac_i
-
-            jacobian[w_i] = (jacobian[w_i] +
-                             exp(jac_i_norm))
-
-            for j in range(hess_size):
-                hess_i_j = exp(jac_i +
-                               log(counts[start + j]) -
-                               log(log_totals[start + j]))
-
-                if i == j:
-                    hess_i_j *= (counts_i - 1) / counts_i
-                if geometric_norm > 0:
-                    hess_i_j = hess_i_j ** len_doc_recip
-                if arithmetic_norm > 0:
-                    hess_i_j = hess_i_j / totals_i
-                if isnan(hess_i_j) or isinf(hess_i_j):
-                    continue
-
-                w_j = indices[start + j]
-                for k in range(embed_size):
-                    embed_dot = (embed_vecs[w_i, k] +
-                                 hess_i_j *
-                                 hash_vecs[w_j, k])
-                    embed_vecs[w_i, k] = embed_dot
-
-        start = end
-
-@cython.boundscheck(False)
-@cython.cdivision(True)
-@cython.wraparound(False)
 cdef void cy_train_chunk_configurable_scaling(
         long[:] ends,
         long[:] indices,
@@ -299,9 +200,9 @@ cdef void cy_train_chunk_configurable_scaling(
     cdef long i, j, k, w_i, w_j, doc_ix
 
     # This performs almost the same operation as the above function
-    # `cy_train_chunk_jacobian`, but provides several configurable
-    # behaviors. Notes are omitted entirely; for documentation, see
-    # comments to above functions.
+    # `cy_train_chunk_combined`, but provides several configurable
+    # behaviors. Most notes are omitted entirely; for documentation, see
+    # above comments.
 
     for doc_ix in range(n_docs):
         end = ends[doc_ix]
@@ -332,7 +233,8 @@ cdef void cy_train_chunk_configurable_scaling(
 
             # Geometric scaling is applied to both the jacobian and hessian.
             # Multiplying because we're still in log space.
-            jac_i_norm = jac_i * len_doc_recip
+            # jac_i_norm = jac_i * len_doc_recip
+            jac_i_norm = jac_i * geometric_scaling
 
             jacobian[w_i] = (jacobian[w_i] +
                              exp(jac_i_norm))
@@ -346,7 +248,16 @@ cdef void cy_train_chunk_configurable_scaling(
                     hess_i_j *= (counts_i - 1) / counts_i
 
                 # Geometric scaling; out of log space so it's a power now.
-                hess_i_j = hess_i_j ** len_doc_recip
+                # Note that when I replaced this with a simple square root,
+                # everything worked about as well as the best
+                # geometric_scaling parameter, and with all other settings
+                # exactly the same. There is a chance this is just a very
+                # elaborate way of taking the square root... but I don't
+                # understand why we would need to take the square root,
+                # whereas the geometric mean seems somewhat reasonable.
+                # hess_i_j = hess_i_j ** len_doc_recip
+                hess_i_j = hess_i_j ** geometric_scaling
+
                 if arithmetic_norm > 0:
                     hess_i_j = hess_i_j / totals_i
                 if isnan(hess_i_j) or isinf(hess_i_j):
@@ -469,35 +380,14 @@ def train_chunk_cy(docarray, hash_vectors):
     nonzero_ix = embed_vectors.sum(axis=1) > 0
     return embed_vectors[nonzero_ix], nonzero_ix.nonzero()
 
-# For best performance, this is the function to use.
-def train_chunk_configurable(docarray, hash_vectors,
-                             embed_vectors_out, embed_vectors_buf,
-                             jacobian_out, jacobian_buf,
-                             arithmetic_norm=False,
-                             geometric_norm=False):
-    ends, indices, counts, totals, log_totals = docarray.features()
-    embed_vectors = numpy.zeros(hash_vectors.shape, dtype=numpy.float64)
-    jacobian = numpy.zeros(hash_vectors.shape[0], dtype=numpy.float64)
-
-    arithmetic_norm = int(bool(arithmetic_norm))
-    geometric_norm = int(bool(geometric_norm))
-    cy_train_chunk_configurable(ends, indices, counts,
-                                totals, log_totals,
-                                jacobian, embed_vectors, hash_vectors,
-                                arithmetic_norm, geometric_norm)
-
-    with embed_vectors_buf.get_lock():
-        embed_vectors_out += embed_vectors
-
-    with jacobian_buf.get_lock():
-        jacobian_out += jacobian
-
 def train_chunk_configurable_scaling(docarray, hash_vectors,
                                      embed_vectors_out, embed_vectors_buf,
                                      jacobian_out, jacobian_buf,
                                      geometric_scaling,
-                                     arithmetic_norm=False):
+                                     arithmetic_norm=False,
+                                     cosine_norm=False):
     ends, indices, counts, totals, log_totals = docarray.features()
+    n_docs = len(ends)
     embed_vectors = numpy.zeros(hash_vectors.shape, dtype=numpy.float64)
     jacobian = numpy.zeros(hash_vectors.shape[0], dtype=numpy.float64)
 
@@ -507,13 +397,17 @@ def train_chunk_configurable_scaling(docarray, hash_vectors,
                                         jacobian, embed_vectors, hash_vectors,
                                         geometric_scaling, arithmetic_norm)
 
+    if cosine_norm:
+        embed_norm = (embed_vectors * embed_vectors).sum(axis=1)[:, None] ** 0.5
+        embed_norm[embed_norm == 0] = 1
+        embed_vectors /= embed_norm
+    embed_vectors /= n_docs * 10000
+
     with embed_vectors_buf.get_lock():
         embed_vectors_out += embed_vectors
 
     with jacobian_buf.get_lock():
         jacobian_out += jacobian
-
-
 
 # This can be regarded as a middle-way reference implementation
 # that uses pure cython objects for inner loops (via the
