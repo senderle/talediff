@@ -15,7 +15,7 @@ from sparsehess import train_chunk_configurable_scaling
 # via this one. No other module should directly refer to the `sparsehess`
 # module.
 
-_NO_WARN = (train_chunk_configurable_scaling, train_chunk_vanlla_full)
+_NO_WARN = (train_chunk_configurable_scaling, train_chunk_vanilla_full)
 
 # A heisenbug occurred here. `set` produced random orderings of
 # punctuation characters. Some of those orderings produced regexes
