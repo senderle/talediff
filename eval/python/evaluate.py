@@ -66,6 +66,8 @@ def evaluate_vectors(W, vocab, ivocab):
         ind1, ind2, ind3, ind4 = indices.T
 
         predictions = np.zeros((len(indices),))
+        predictions2 = np.zeros((len(indices),))
+        predictions3 = np.zeros((len(indices),))
         num_iter = int(np.ceil(len(indices) / float(split_size)))
         for j in range(num_iter):
             subset = np.arange(j*split_size, min((j + 1)*split_size, len(ind1)))
@@ -82,8 +84,15 @@ def evaluate_vectors(W, vocab, ivocab):
 
             # predicted word index
             predictions[subset] = np.argmax(dist, 0).flatten()
+            dist[np.argmax(dist, 0), :] = -np.Inf
+            predictions2[subset] = np.argmax(dist, 0).flatten()
+            dist[np.argmax(dist, 0), :] = -np.Inf
+            predictions3[subset] = np.argmax(dist, 0).flatten()
 
-        val = (ind4 == predictions) # correct predictions
+
+        val = ((ind4 == predictions) |
+               (ind4 == predictions2) |
+               (ind4 == predictions3)) # top 3 predictions
         count_tot = count_tot + len(ind1)
         correct_tot = correct_tot + sum(val)
         if i < 5:
@@ -94,7 +103,7 @@ def evaluate_vectors(W, vocab, ivocab):
             correct_syn = correct_syn + sum(val)
 
         print("%s:" % filenames[i])
-        print('ACCURACY TOP1: %.2f%% (%d/%d)' %
+        print('ACCURACY TOP3: %.2f%% (%d/%d)' %
             (np.mean(val) * 100, np.sum(val), len(val)))
 
     print('Questions seen/total: %.2f%% (%d/%d)' %

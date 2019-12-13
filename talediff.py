@@ -119,16 +119,17 @@ def parse_args():
         help='A directory containing text files for training a model.'
     )
     parser.add_argument(
-        '--with-jacobian',
-        action='store_true',
-        default=False,
-        help='Calculate the jacobian for use as a normalizing factor.'
-    )
-    parser.add_argument(
         '--arithmetic-norm',
         action='store_true',
         default=False,
         help='Use arithmetic normalization.'
+    )
+    parser.add_argument(
+        '-C',
+        '--cosine-norm',
+        action='store_true',
+        default=False,
+        help='Normalize results using cosine distance after every batch.'
     )
     parser.add_argument(
         '-g',
@@ -161,14 +162,6 @@ def parse_args():
         default=0,
         help='The standard distribution of the window size distribution, '
         'as a fraction of the window size. Defaults to 0.5'
-    )
-    parser.add_argument(
-        '--annotate',
-        action='store_true',
-        default=False,
-        help='Add annotations to words indicating their position in '
-        'sentences. This is currently experimental, and does not yet '
-        'produce good results.'
     )
     parser.add_argument(
         '-f',
@@ -232,21 +225,6 @@ def parse_args():
         'using hutter8 data.'
     )
     parser.add_argument(
-        '-t',
-        '--save-truncated-vectors',
-        type=int,
-        default=0,
-        help='Perform dimension reduction using SVD and preserve this many '
-        'dimensions. By default, no dimension reduction is performed.'
-    )
-    parser.add_argument(
-        '-C',
-        '--cosine-norm',
-        action='store_true',
-        default=False,
-        help='Normalize results using cosine distance after every batch.'
-    )
-    parser.add_argument(
         '-V',
         '--max-vocab',
         type=int,
@@ -261,13 +239,6 @@ def parse_args():
         default=False,
         help='Rather than training a model, perform a battery of tests to the '
         'hessian-generating code.'
-    )
-    parser.add_argument(
-        '--test-train-chunk',
-        action='store_true',
-        default=False,
-        help='Rather than training a model, perform a battery of tests to the '
-        'chunkwise training code.'
     )
     parser.add_argument(
         '-d',
@@ -299,27 +270,23 @@ def parse_args():
     if not args.demo and not args.evaluate:
         args.demo = True
 
-    if args.test_train_chunk:
-        args.number_of_windows = 10000
-
     return args
 
 def doc_iter(textdir, window_size, window_sigma,
-             annotate, n_windows):
+             n_windows):
     textfiles = sorted(os.path.join(textdir, f) for f in os.listdir(textdir))
     alldocs = (sent for fn in textfiles
                for sent in util.load(fn,
                                      window_size=window_size,
-                                     window_sigma=window_sigma,
-                                     annotate=annotate))
+                                     window_sigma=window_sigma))
     if n_windows > 0:
         return islice(alldocs, n_windows)
     else:
         return alldocs
 
 def batch_doc_iter(textdir, window_size, window_sigma,
-                   annotate, n_windows, batchsize):
-    docs = doc_iter(textdir, window_size, window_sigma, annotate, n_windows)
+                   n_windows, batchsize):
+    docs = doc_iter(textdir, window_size, window_sigma, n_windows)
     end = object()
     while True:
         batch = islice(docs, batchsize)
@@ -331,18 +298,6 @@ def batch_doc_iter(textdir, window_size, window_sigma,
         else:
             yield chain((next_item,), batch)
 
-def main_test_train(args):
-    textdir = args.text_directory
-    alldocs = doc_iter(textdir,
-                       args.window_size,
-                       args.window_sigma,
-                       args.annotate,
-                       args.number_of_windows)
-    alldocs = DocArray(islice(alldocs, 100000))
-    emb = Embedding(alldocs)
-    print('Testing a {}-dimension base embedding.'.format(emb.n_bits))
-    emb.train_test_chunk_sp()
-
 def main(args):
     textdir = args.text_directory
     emb = Embedding(DocArray(eval_mode=args.eval_mode,
@@ -353,12 +308,6 @@ def main(args):
 
     print('Creating a {}-dimension base embedding.'.format(emb.n_bits))
 
-    # print('Doc examples:')
-    # examples = doc_iter(textdir, args.window_size,
-    #                     args.window_sigma, args.annotate, 10)
-    # for i in range(10):
-    #     print(next(examples))
-
     n_iters = args.number_of_iterations
     for i in range(n_iters):
         print('Iteration {}...'.format(i))
@@ -367,11 +316,11 @@ def main(args):
 
         n_words = 0
 
-        batch_size = 350000
+        # Eatch batch should contain roughly 20 million words.
+        batch_size = 20000000 // args.window_size
         batches = batch_doc_iter(textdir,
                                  args.window_size,
                                  args.window_sigma,
-                                 args.annotate,
                                  args.number_of_windows,
                                  batch_size)
 
@@ -379,18 +328,16 @@ def main(args):
             print(' Batch {}...'.format(batch_n))
 
             emb.overwrite_docarray(batch)
-            emb.train_multi(with_jacobian=args.with_jacobian,
-                            cosine_norm=args.cosine_norm,
+            emb.train_multi(cosine_norm=args.cosine_norm,
                             arithmetic_norm=args.arithmetic_norm,
                             geometric_scaling=args.geometric_scaling)
 
             n_words += batch_size * args.window_size
             print(' {} tokens processed'.format(n_words))
-            if batch_n and not batch_n % (300 // args.window_size):
+            # if batch_n and not batch_n % 5:
+            if True:
                 emb.save_vectors('vectors.txt',
-                                 mincount=args.save_mincount,
-                                 truncate=None,
-                                 include_annotated=False)
+                                 mincount=args.save_mincount)
                 emb.save_vocab('vocab.txt', mincount=args.save_mincount)
                 if args.evaluate:
                     subprocess.run(['python', 'eval/python/evaluate.py'])
@@ -398,17 +345,8 @@ def main(args):
         if args.demo:
             demo_out(emb, i)
 
-    try:
-        truncate = int(args.save_truncated_vectors)
-        if truncate == 0:
-            truncate = None
-    except ValueError:
-        truncate = None
-
     emb.save_vectors('vectors.txt',
-                     mincount=args.save_mincount,
-                     truncate=truncate,
-                     include_annotated=False)
+                     mincount=args.save_mincount)
     emb.save_vocab('vocab.txt', mincount=args.save_mincount)
     if args.evaluate:
         subprocess.run(['python', 'eval/python/evaluate.py'])
@@ -429,7 +367,5 @@ if __name__ == '__main__':
     if args.test_hessian:
         print("running hessian tests")
         util.test_hessians()
-    elif args.test_train_chunk:
-        main_test_train(args)
     else:
         main(args)

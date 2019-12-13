@@ -87,7 +87,7 @@ class DocArray(abc.Sequence):
             self.word_index = dict(documents.word_index)
             self._word_count = ExtendWrap(documents._word_count)
             self._word_count_total = documents._word_count.array.sum()
-            self._log_word_count = ExtendWrap(documents._log_counts)
+            self._word_weight = ExtendWrap(documents._word_weight)
             self._ends = ExtendWrap(documents._ends)
             self._indices = ExtendWrap(documents._indices)
             self._counts = ExtendWrap(documents._counts)
@@ -125,7 +125,7 @@ class DocArray(abc.Sequence):
             new._ends.extend(new_ends)
             new._word_count.extend(self._word_count)
             new._word_count_total = self._word_count_total
-            new._log_word_count.extend(self._log_word_count)
+            new._word_weight.extend(self._word_weight)
             new._indices.extend(self._indices[new_index])
             new._counts.extend(self._counts[new_index])
             return new
@@ -135,7 +135,7 @@ class DocArray(abc.Sequence):
             return (self._indices[start:end],
                     self._counts[start:end],
                     self._word_count[self._indices[start:end]],
-                    self._log_word_count[self._indices[start:end]])
+                    self._word_weight[self._indices[start:end]])
 
     def __add__(self, right):
         left = DocArray(self)
@@ -157,6 +157,10 @@ class DocArray(abc.Sequence):
                                                  self.sparsifier)
         return self._hash_vectors
 
+    @property
+    def mean_doc_length(self):
+        return numpy.diff(self._ends.array).mean()
+
     # Reset the word index. This also empties out the documents, since they
     # are useless wihtout the word index.
     def empty_index(self):
@@ -166,7 +170,7 @@ class DocArray(abc.Sequence):
         self._word_count = ExtendWrap(
             numpy.zeros(0, dtype=numpy.float64))
         self._word_count_total = 0
-        self._log_word_count = ExtendWrap(
+        self._word_weight = ExtendWrap(
             numpy.zeros(0, dtype=numpy.float64))
 
         self.empty_docs()
@@ -186,13 +190,13 @@ class DocArray(abc.Sequence):
                 self._indices.array,
                 self._counts.array,
                 self._word_count.array[self._indices],
-                self._log_word_count.array[self._indices])
+                self._word_weight.array[self._indices])
 
     def str_count(self, word_string):
         return self._word_count[self.word_index[word_string]]
 
     def iter_as_documents(self):
-        for indices, counts, totals, log_totals in self:
+        for indices, counts, totals, weights in self:
             yield [w
                    for ix, ct in zip(indices, counts)
                    for w in [self.words[ix]] * ct]
@@ -212,7 +216,7 @@ class DocArray(abc.Sequence):
                 self.words.append(w)
                 self.word_index[w] = i + old_len
             self._word_count.extend([0] * len(new))
-            self._log_word_count.extend([0] * len(new))
+            self._word_weight.extend([0] * len(new))
 
             self._hash_vectors = None
 
@@ -252,33 +256,33 @@ class DocArray(abc.Sequence):
             for ix, ct in total.items():
                 self._word_count[ix] += ct
                 if self.eval_mode == 'log':
-                    self._log_word_count[ix] = \
+                    self._word_weight[ix] = \
                         numpy.log10(self._word_count[ix]) + 1
                 elif self.eval_mode == '1log':
-                    self._log_word_count[ix] = \
+                    self._word_weight[ix] = \
                         1 / (numpy.log10(self._word_count[ix]) + 1)
                 elif self.eval_mode == 'unitscalefree':
-                    self._log_word_count[ix] = \
+                    self._word_weight[ix] = \
                         numpy.exp(
                             self._word_count[ix] / word_count_total -
                             mean_word_freq / word_count_total)
                 elif self.eval_mode == 'scalefree':
-                    self._log_word_count[ix] = \
+                    self._word_weight[ix] = \
                         numpy.exp(
                             self._word_count[ix] / word_count_total -
                             sq_word_prob_sum)
                 elif self.eval_mode == '1scalefree':
-                    self._log_word_count[ix] = \
+                    self._word_weight[ix] = \
                         numpy.exp(
                             sq_word_prob_sum -
                             self._word_count[ix] / word_count_total)
                 elif self.eval_mode == '_test':
-                    self._log_word_count[ix] = \
+                    self._word_weight[ix] = \
                         numpy.exp(
                             self._word_count[ix] / word_count_total -
                             sq_word_prob_sum)
                 elif self.eval_mode in ('', '1', 'one'):
-                    self._log_word_count[ix] = 1
+                    self._word_weight[ix] = 1
 
             indices, counts = zip(*[i_c
                                     for doc in document_counts
@@ -429,21 +433,19 @@ class DocArray(abc.Sequence):
 # For multiprocessing, the following functions must
 # be in the global namespace of this module.
 
-def train_chunk_star(docarray_hash_vectors):
-    docarray, hash_vectors = docarray_hash_vectors
-    return util.train_chunk(docarray, hash_vectors)
-
-def train_chunk_star_sp(docarray_hash_vectors):
-    docarray, hash_vectors = docarray_hash_vectors
-    return util.train_chunk_cy(docarray, hash_vectors)
-
 def train_chunk_multi(slice):
-    util.train_chunk_configurable_scaling(
+    # util.train_chunk_configurable_scaling(
+    #     MP_DOC_ARRAY[slice], MP_HASH_VECS,
+    #     MP_EMBED_OUT, MP_EMBED_BUF,
+    #     MP_JACOB_OUT, MP_JACOB_BUF,
+    #     MP_GEOM_SCALE, MP_ARITH_NORM,
+    #     MP_COSINE_NORM)
+    util.train_chunk_vanilla_full(
         MP_DOC_ARRAY[slice], MP_HASH_VECS,
-        MP_EMBED_OUT, MP_EMBED_BUF,
+        MP_FOUT_OUT, MP_FOUT_BUF,
         MP_JACOB_OUT, MP_JACOB_BUF,
-        MP_GEOM_SCALE, MP_ARITH_NORM,
-        MP_COSINE_NORM)
+        MP_EMBED_OUT, MP_EMBED_BUF)
+
 
 class Embedding(object):
     def __init__(self, docarray=None):
@@ -482,31 +484,41 @@ class Embedding(object):
             self.hash_iter_vectors = self.hash_vectors.copy()
 
     def _new_embedding(self):
-        emb, buf = _buffered_array(self.hash_vectors.shape,
-                                   dtype=numpy.float64)
-        emb[:] = 0
-        self.embed_vectors = emb
-        self.embed_vectors_buffer = buf
-
         jac, jac_buf = _buffered_array((self.hash_vectors.shape[0],),
                                        dtype=numpy.float64)
         jac[:] = 0
         self.jacobian_vector = jac
         self.jacobian_vector_buffer = jac_buf
 
+        emb, buf = _buffered_array(self.hash_vectors.shape,
+                                   dtype=numpy.float64)
+        emb[:] = 0
+        self.embed_vectors = emb
+        self.embed_vectors_buffer = buf
+
+        fout, buf = _buffered_array((1,),
+                                    dtype=numpy.float64)
+        fout[:] = 0
+        self.fout = fout
+        self.fout_buffer = buf
+
     def _extend_embedding(self):
         old_emb = self.embed_vectors
         old_jac = self.jacobian_vector
+        old_fout = self.fout[0]
 
         self._new_embedding()
         self.embed_vectors[:len(old_emb)] = old_emb
         self.jacobian_vector[:len(old_jac)] = old_jac
+        self.fout[0] = old_fout
 
     def step_embedding(self):
-        self.hash_iter_vectors = self._sparsify_embedding()
-        if hasattr(self, 'jacobian_vector'):
-            self.hash_iter_vectors /= self.jacobian_vector[:, None]
-        self._erase_on_reset = True
+        raise NotImplementedError('Iterated embedding is not '
+                                  'currently supported')
+        # self.hash_iter_vectors = self._sparsify_embedding()
+        # if hasattr(self, 'jacobian_vector'):
+        #     self.hash_iter_vectors /= self.jacobian_vector[:, None]
+        # self._erase_on_reset = True
 
     def _reset_embedding(self):
         if self._erase_on_reset:
@@ -629,11 +641,6 @@ class Embedding(object):
 
         return result, s
 
-    def train(self):
-        self._reset_embedding()
-        embed = util.train_chunk(self.docarray, self.hash_iter_vectors)
-        self.embed_vectors += embed
-
     def _chunkparams(self, embed_shape):
         # Eventually, try to guess how much memory is available and try
         # to balance chunksize and n_procs against avialable memory.
@@ -641,7 +648,8 @@ class Embedding(object):
 
         n_words, n_dims = embed_shape
         min_chunksize = 1000
-        max_chunksize = 2 ** 22 // n_dims
+        mean_doc_length = int(self.docarray.mean_doc_length) + 1
+        max_chunksize = (2 ** 28 // mean_doc_length) // n_dims
         n_docs = len(self.docarray)
         n_procs = multiprocessing.cpu_count()
         chunksize = n_docs // n_procs + 1
@@ -657,7 +665,6 @@ class Embedding(object):
         return iter(chunkslicer, ())
 
     def train_multi(self,
-                    with_jacobian=False,
                     cosine_norm=False,
                     arithmetic_norm=False,
                     geometric_scaling=1):
@@ -666,16 +673,19 @@ class Embedding(object):
         chunksize, n_procs = self._chunkparams(self.hash_iter_vectors.shape)
 
         global MP_DOC_ARRAY, MP_HASH_VECS
-        global MP_EMBED_OUT, MP_EMBED_BUF
+        global MP_FOUT_OUT, MP_FOUT_BUF
         global MP_JACOB_OUT, MP_JACOB_BUF
+        global MP_EMBED_OUT, MP_EMBED_BUF
         global MP_GEOM_SCALE, MP_ARITH_NORM, MP_COSINE_NORM
 
         MP_DOC_ARRAY = self.docarray
         MP_HASH_VECS = self.hash_iter_vectors
-        MP_EMBED_OUT = self.embed_vectors
-        MP_EMBED_BUF = self.embed_vectors_buffer
+        MP_FOUT_OUT = self.fout
+        MP_FOUT_BUF = self.fout_buffer
         MP_JACOB_OUT = self.jacobian_vector
         MP_JACOB_BUF = self.jacobian_vector_buffer
+        MP_EMBED_OUT = self.embed_vectors
+        MP_EMBED_BUF = self.embed_vectors_buffer
         MP_GEOM_SCALE = geometric_scaling
         MP_ARITH_NORM = arithmetic_norm
         MP_COSINE_NORM = cosine_norm
@@ -706,14 +716,10 @@ class Embedding(object):
                           flush=True)
             print()
 
-        if with_jacobian:
-            self.jacobian_vector[self.jacobian_vector == 0] = 1
-            self.embed_vectors /= self.jacobian_vector[:, None]
-
     def train_simple(self):
         self._reset_embedding()
         hash_vectors = self.hash_iter_vectors
-        for indices, counts, totals, log_totals in self.docarray:
+        for indices, counts, totals, weights in self.docarray:
             # Documents with only one word do us no good.
             doc_len = counts.sum()
             if doc_len < 2:
@@ -731,19 +737,37 @@ class Embedding(object):
             # words from having larger effects.
             self.embed_vectors[indices] += context_vecs / totals[:, None]
 
-    def save_vectors(self, filename, mincount=10, truncate=None,
-                     include_annotated=True):
+    def save_vectors(self, filename, mincount=10):
 
-        if truncate is None:
-            truncate = self.embed_vectors.shape[1]
-            embed_vectors = self.embed_vectors
-        else:
-            embed_vectors, s = self._eigen_embedding()
-            if truncate <= 0:
-                truncate = len(s[s > 0.001])
+        # The hessian of the log of a function is equal to the
+        # hessian of the function divided by the value of the function,
+        # minus the jacobian outer product divided by the squared value
+        # of the function. This performs those additional operations
+        # and reports a few simple statistics to verify that everything
+        # is working as expected.
 
-        if include_annotated:
-            truncate //= 2
+        embed_vectors = self.embed_vectors / self.fout
+        print('Pre-normalization:')
+        print('  fout: ', self.fout[0])
+        print('  embed max: ', embed_vectors.ravel().max())
+        print('  embed min: ', embed_vectors.ravel().min())
+        print('  embed avg: ', embed_vectors.ravel().mean())
+
+        jacobian_norm = self.jacobian_vector / self.fout
+        # jacobian_norm = jacobian_norm *
+        jacobian_rand = jacobian_norm @ self.hash_iter_vectors
+        jacobian_rand = (jacobian_norm.reshape(-1, 1) @
+                         jacobian_rand.reshape(1, -1))
+        print('Jacobian normalizer:')
+        print('  jac-norm max: ', jacobian_rand.ravel().max())
+        print('  jac-norm min: ', jacobian_rand.ravel().min())
+        print('  jac-norm avg: ', jacobian_rand.ravel().mean())
+
+        embed_vectors -= jacobian_rand
+        print('Post-normalization:')
+        print('  embed max: ', embed_vectors.ravel().max())
+        print('  embed min: ', embed_vectors.ravel().min())
+        print('  embed avg: ', embed_vectors.ravel().mean())
 
         tot = self.docarray._word_count
         wix = self.docarray.word_index
@@ -751,25 +775,13 @@ class Embedding(object):
                        key=lambda w: tot[wix[w]],
                        reverse=True)
 
-        # NOTE: Words ending with '_' are assumed to be "annotated,"
-        #       and are merged with their unannotated versions or
-        #       dropped from the final output.
         words = [w for w in words
                  if tot[wix[w]] >= mincount and
-                 not w.endswith('_') and
                  wix[w] != (self.docarray.max_vocab - 1)]
 
-        vecs = (embed_vectors[wix[w]][:truncate] for w in words)
-        sample_vec = embed_vectors[wix[words[0]]][:truncate]
+        vecs = (embed_vectors[wix[w]] for w in words)
+        sample_vec = embed_vectors[wix[words[0]]]
         print('Final vector size: {} dimensions'.format(len(sample_vec)))
-
-        if include_annotated:
-            # Concatenate the vectors for annotated and
-            # unannotated versions of each word.
-            words_ = [w + '_' for w in words]
-            vecs_ = (embed_vectors[wix[w_]][:truncate] for w_ in words_)
-            vecs = (numpy.concatenate([v, v_])
-                    for v, v_ in zip(vecs, vecs_))
 
         rows = ('{} {}\n'.format(w, ' '.join(str(v) for v in vec))
                 for w, vec in zip(words, vecs))
@@ -798,50 +810,4 @@ class Embedding(object):
             for r in rows:
                 op.write(r)
 
-# This is dead code and should be removed eventually. But I may
-# want to reuse it to create a new set of tests, so I'm not
-# deleting it yet.
 
-#     def train_test_chunk_sp(self):
-#         """
-#         As of 2017-10-22, this passes consistently.
-#         """
-#         hash_vectors = self.hash_iter_vectors
-#         chunksize = 2000
-#         chunks = ((self.docarray[i:i + chunksize], hash_vectors)
-#                   for i in range(0, len(self.docarray), chunksize))
-#
-#         error_records = []
-#         for ch_ix, chunk in enumerate(chunks):
-#             r1 = train_chunk_star(chunk)
-#             r1 = r1[r1.sum(axis=1) > 0]
-#             r2 = train_chunk_star_sp(chunk)
-#             r2, r2ix = r2
-#             try:
-#                 assert numpy.allclose(r1, r2)
-#             except AssertionError:
-#                 tol = 1e-10
-#                 abs_error = numpy.abs(r1 - r2)
-#                 bad_errors = abs_error[(abs_error > tol).nonzero()]
-#                 bad_error_ratio = bad_errors.shape[0]
-#                 bad_error_ratio /= r1.shape[0] * r1.shape[1]
-#
-#                 print()
-#                 print("Fraction of bad errors (> {}):".format(tol))
-#                 print(bad_error_ratio)
-#                 print("Mean bad error:")
-#                 print(bad_errors.mean())
-#                 print("Median bad error:")
-#                 print(numpy.median(bad_errors))
-#                 print("Max bad error:")
-#                 print(bad_errors.max())
-#                 print()
-#                 if bad_error_ratio > 1e-5:
-#                     error_records.append((ch_ix, bad_error_ratio))
-#
-#             self.embed_vectors[r2ix] += r2
-#
-#         if error_records:
-#             raise RuntimeError("_train_test_chunk_sp: test failed")
-#         else:
-#             print('All chunkwise training tests passed.')
