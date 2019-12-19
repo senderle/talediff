@@ -434,7 +434,7 @@ cdef void cy_train_chunk_exponential_full(
                      log(weights_i))
 
             # Briefly drop out of log space to update jacobian
-            jacobian[w_i] = (jacobian[w_i] + exp(jac_i))
+            jacobian[w_i] = (jacobian[w_i] + exp(jac_i) * weights_i)
 
             for j in range(hess_size):
                 # Caclulate a hessian term by repeating the process used to
@@ -653,6 +653,37 @@ def train_chunk_vanilla_full(docarray,
 
     with random_hessian_projection_buf.get_lock():
         random_hessian_projection_out += random_hessian_projection
+
+def train_chunk_exponential_full(docarray,
+                                 hash_vectors,
+                                 fout_out,
+                                 fout_buf,
+                                 jacobian_out,
+                                 jacobian_buf,
+                                 random_hessian_projection_out,
+                                 random_hessian_projection_buf):
+    ends, indices, counts, totals, weights = docarray.features()
+    n_docs = len(ends)
+
+    fout = numpy.zeros((1,), dtype=numpy.float64)
+    random_hessian_projection = numpy.zeros(hash_vectors.shape,
+                                            dtype=numpy.float64)
+    jacobian = numpy.zeros(hash_vectors.shape[0], dtype=numpy.float64)
+
+
+    cy_train_chunk_exponential_full(fout, jacobian, random_hessian_projection,
+                                    ends, indices, counts, totals, weights,
+                                    hash_vectors)
+
+    with fout_buf.get_lock():
+        fout_out += fout
+
+    with jacobian_buf.get_lock():
+        jacobian_out += jacobian
+
+    with random_hessian_projection_buf.get_lock():
+        random_hessian_projection_out += random_hessian_projection
+
 
 # This can be regarded as a middle-way reference implementation
 # that uses pure cython objects for inner loops (via the

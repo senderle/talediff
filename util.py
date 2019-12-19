@@ -3,19 +3,25 @@ import string
 import numpy
 import random
 
+from itertools import islice
+from zipfile import ZipFile
+from io import TextIOWrapper
+
 from sklearn.linear_model import SGDClassifier
 
-from itertools import islice
 
 from sparsehess import block_logspace_hessian as block_logspace_hessian_sp
-from sparsehess import train_chunk_vanilla_full
 from sparsehess import train_chunk_configurable_scaling
+from sparsehess import train_chunk_exponential_full
+from sparsehess import train_chunk_vanilla_full
 
 # Cause pyflakes to ignore unused imports; these are used in other modules
 # via this one. No other module should directly refer to the `sparsehess`
 # module.
 
-_NO_WARN = (train_chunk_configurable_scaling, train_chunk_vanilla_full)
+_NO_WARN = (train_chunk_configurable_scaling, 
+            train_chunk_exponential_full,
+            train_chunk_vanilla_full)
 
 # A heisenbug occurred here. `set` produced random orderings of
 # punctuation characters. Some of those orderings produced regexes
@@ -84,17 +90,18 @@ def load_and_annotate_windows(txt, window_size=15):
         annotated.append(s_head_ + s_tail)
     return annotated
 
-def load(fn, window_size=15, window_sigma=0.5, annotate=False):
-    with open(fn) as ip:
-        txt = ip.read()
-
-    # if '.' in txt:
-    #     return load_and_split(txt)
-    if annotate:
-        return load_and_annotate_windows(txt, window_size)
+def load(fn, window_size=15, window_sigma=0.5):
+    if fn.endswith('.zip'):
+        with ZipFile(fn) as ipz:
+            names = ipz.namelist()
+            if names and names[0].endswith('.txt'):
+                with ipz.open(names[0]) as ip:
+                    txt = TextIOWrapper(ip, encoding='utf-8').read()
     else:
-        # return load_and_make_windows(txt, window_size)
-        return load_and_make_random_windows(txt, window_size, window_sigma)
+        with open(fn) as ip:
+            txt = ip.read()
+
+    return load_and_make_random_windows(txt, window_size, window_sigma)
 
 def group(it, n):
     it = iter(it)

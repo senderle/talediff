@@ -3,7 +3,7 @@ import multiprocessing
 
 import ctypes
 
-# import psutil
+import psutil
 
 from collections import Counter
 from collections import abc
@@ -276,6 +276,16 @@ class DocArray(abc.Sequence):
                         numpy.exp(
                             sq_word_prob_sum -
                             self._word_count[ix] / word_count_total)
+                elif self.eval_mode == 'lognorm':
+                    approx_rank = int(0.035 / (self._word_count[ix] / word_count_total)) + 1
+                    sigma = 1.2
+                    mu = 8
+                    amp = 3
+                    base = 0.9
+                    lognormal_scale = amp / ((approx_rank * 2 * sigma * numpy.pi) ** 0.5)
+                    self._word_weight[ix] = base + \
+                        numpy.exp(-((numpy.log(approx_rank) - mu) ** 2) /
+                                  (2 * sigma ** 2)) * lognormal_scale
                 elif self.eval_mode == '_test':
                     self._word_weight[ix] = \
                         numpy.exp(
@@ -445,6 +455,12 @@ def train_chunk_multi(slice):
         MP_FOUT_OUT, MP_FOUT_BUF,
         MP_JACOB_OUT, MP_JACOB_BUF,
         MP_EMBED_OUT, MP_EMBED_BUF)
+    # util.train_chunk_exponential_full(
+    #     MP_DOC_ARRAY[slice], MP_HASH_VECS,
+    #     MP_FOUT_OUT, MP_FOUT_BUF,
+    #     MP_JACOB_OUT, MP_JACOB_BUF,
+    #     MP_EMBED_OUT, MP_EMBED_BUF)
+
 
 
 class Embedding(object):
@@ -484,6 +500,12 @@ class Embedding(object):
             self.hash_iter_vectors = self.hash_vectors.copy()
 
     def _new_embedding(self):
+        fout, buf = _buffered_array((1,),
+                                    dtype=numpy.float64)
+        fout[:] = 0
+        self.fout = fout
+        self.fout_buffer = buf
+
         jac, jac_buf = _buffered_array((self.hash_vectors.shape[0],),
                                        dtype=numpy.float64)
         jac[:] = 0
@@ -496,21 +518,27 @@ class Embedding(object):
         self.embed_vectors = emb
         self.embed_vectors_buffer = buf
 
-        fout, buf = _buffered_array((1,),
-                                    dtype=numpy.float64)
-        fout[:] = 0
-        self.fout = fout
-        self.fout_buffer = buf
+        emb, buf = _buffered_array(self.hash_vectors.shape,
+                                   dtype=numpy.float64)
+        emb[:] = 0
+        self.embed_vectors_accumulated = emb
+        self.embed_vectors_accumulated_buffer = buf
+
+        self.n_batches_complete = 0
 
     def _extend_embedding(self):
+        old_emb_mean = self.embed_vectors_accumulated
         old_emb = self.embed_vectors
         old_jac = self.jacobian_vector
         old_fout = self.fout[0]
+        old_n_batches = self.n_batches_complete
 
         self._new_embedding()
+        self.embed_vectors_accumulated[:len(old_emb_mean)] = old_emb_mean
         self.embed_vectors[:len(old_emb)] = old_emb
         self.jacobian_vector[:len(old_jac)] = old_jac
         self.fout[0] = old_fout
+        self.n_batches_complete = old_n_batches
 
     def step_embedding(self):
         raise NotImplementedError('Iterated embedding is not '
@@ -644,12 +672,12 @@ class Embedding(object):
     def _chunkparams(self, embed_shape):
         # Eventually, try to guess how much memory is available and try
         # to balance chunksize and n_procs against avialable memory.
-        # psutil.virtual_memory().available
-
+        
+        mem_gigs_avail = psutil.virtual_memory().available
         n_words, n_dims = embed_shape
         min_chunksize = 1000
         mean_doc_length = int(self.docarray.mean_doc_length) + 1
-        max_chunksize = (2 ** 28 // mean_doc_length) // n_dims
+        max_chunksize = int((mem_gigs_avail * 2 ** 23 // mean_doc_length) // n_dims)
         n_docs = len(self.docarray)
         n_procs = multiprocessing.cpu_count()
         chunksize = n_docs // n_procs + 1
@@ -716,29 +744,6 @@ class Embedding(object):
                           flush=True)
             print()
 
-    def train_simple(self):
-        self._reset_embedding()
-        hash_vectors = self.hash_iter_vectors
-        for indices, counts, totals, weights in self.docarray:
-            # Documents with only one word do us no good.
-            doc_len = counts.sum()
-            if doc_len < 2:
-                continue
-
-            # Sum all word vectors to form one vector for the document.
-            doc_vector = hash_vectors[indices].sum(axis=0)
-
-            # Create context vectors for each word by subtracting the
-            # vector for that word. Also divide by the document length
-            # to prevent long sentencs from having larger effects.
-            context_vecs = (doc_vector - hash_vectors[indices]) / doc_len
-
-            # Finally, divide by each word's frequency to prevent common
-            # words from having larger effects.
-            self.embed_vectors[indices] += context_vecs / totals[:, None]
-
-    def save_vectors(self, filename, mincount=10):
-
         # The hessian of the log of a function is equal to the
         # hessian of the function divided by the value of the function,
         # minus the jacobian outer product divided by the squared value
@@ -746,40 +751,75 @@ class Embedding(object):
         # and reports a few simple statistics to verify that everything
         # is working as expected.
 
+        print()
+        print('    Before scaling by fout:')
+        print('      embed max: ', self.embed_vectors.ravel().max())
+        print('      embed min: ', self.embed_vectors.ravel().min())
+        print('      embed avg: ', self.embed_vectors.ravel().mean())
+
         embed_vectors = self.embed_vectors / self.fout
-        print('Pre-normalization:')
-        print('  fout: ', self.fout[0])
-        print('  embed max: ', embed_vectors.ravel().max())
-        print('  embed min: ', embed_vectors.ravel().min())
-        print('  embed avg: ', embed_vectors.ravel().mean())
+        print('    Before jacobian normalization:')
+        print('      fout: ', self.fout[0])
+        print('      embed max: ', embed_vectors.ravel().max())
+        print('      embed min: ', embed_vectors.ravel().min())
+        print('      embed avg: ', embed_vectors.ravel().mean())
 
         jacobian_norm = self.jacobian_vector / self.fout
-        # jacobian_norm = jacobian_norm *
         jacobian_rand = jacobian_norm @ self.hash_iter_vectors
         jacobian_rand = (jacobian_norm.reshape(-1, 1) @
                          jacobian_rand.reshape(1, -1))
-        print('Jacobian normalizer:')
-        print('  jac-norm max: ', jacobian_rand.ravel().max())
-        print('  jac-norm min: ', jacobian_rand.ravel().min())
-        print('  jac-norm avg: ', jacobian_rand.ravel().mean())
+        print('    Jacobian normalizer:')
+        print('      jac-norm max: ', jacobian_rand.ravel().max())
+        print('      jac-norm min: ', jacobian_rand.ravel().min())
+        print('      jac-norm avg: ', jacobian_rand.ravel().mean())
 
         embed_vectors -= jacobian_rand
-        print('Post-normalization:')
-        print('  embed max: ', embed_vectors.ravel().max())
-        print('  embed min: ', embed_vectors.ravel().min())
-        print('  embed avg: ', embed_vectors.ravel().mean())
+        print('    After jacobian normalization:')
+        print('      embed max: ', embed_vectors.ravel().max())
+        print('      embed min: ', embed_vectors.ravel().min())
+        print('      embed avg: ', embed_vectors.ravel().mean())
 
+        self.n_batches_complete += 1
+        if cosine_norm:
+            norm = (embed_vectors ** 2).sum(axis=1) ** 0.5
+            norm[norm == 0] = 1
+            with self.embed_vectors_accumulated_buffer.get_lock():
+                self.embed_vectors_accumulated += (embed_vectors / norm[:,None] -
+                                                   self.embed_vectors_accumulated) / self.n_batches_complete
+            with self.embed_vectors_buffer.get_lock():
+                self.embed_vectors[:] = 0
+            with self.jacobian_vector_buffer.get_lock():
+                self.jacobian_vector[:] = 0
+            with self.fout_buffer.get_lock():
+                self.fout[:] = 0
+            print('    Accumulated unit-normalized mean:')
+            print('      accumulated max: ', self.embed_vectors_accumulated.ravel().max())
+            print('      accumulated min: ', self.embed_vectors_accumulated.ravel().min())
+            print('      accumulated avg: ', self.embed_vectors_accumulated.ravel().mean())
+        else:
+            with self.embed_vectors_accumulated_buffer.get_lock():
+                self.embed_vectors_accumulated[:] = embed_vectors
+        print()
+        print()
+
+    def _save_wordlist(self, mincount, max_vocab, out_vocab):
         tot = self.docarray._word_count
         wix = self.docarray.word_index
         words = sorted(self.docarray.words,
                        key=lambda w: tot[wix[w]],
                        reverse=True)
-
         words = [w for w in words
                  if tot[wix[w]] >= mincount and
                  wix[w] != (self.docarray.max_vocab - 1)]
+        return words[:out_vocab]
 
+    def save_vectors(self, filename, mincount=10):
+        wix = self.docarray.word_index
+        words = self._save_wordlist(mincount, self.docarray.max_vocab, 400000)
+
+        embed_vectors = self.embed_vectors_accumulated.astype(numpy.float16)
         vecs = (embed_vectors[wix[w]] for w in words)
+
         sample_vec = embed_vectors[wix[words[0]]]
         print('Final vector size: {} dimensions'.format(len(sample_vec)))
 
@@ -795,17 +835,9 @@ class Embedding(object):
     def save_vocab(self, filename, mincount=10):
         tot = self.docarray._word_count
         wix = self.docarray.word_index
-        words = sorted(self.docarray.words,
-                       key=lambda w: tot[wix[w]],
-                       reverse=True)
+        words = self._save_wordlist(mincount, self.docarray.max_vocab, 400000)
 
-        # NOTE: See note above.
-        words = [w for w in words
-                 if tot[wix[w]] >= mincount and
-                 not w.endswith('_') and
-                 wix[w] != (self.docarray.max_vocab - 1)]
-
-        rows = ['{} {}\n'.format(w, tot[wix[w]]) for w in words]
+        rows = ('{} {}\n'.format(w, tot[wix[w]]) for w in words)
         with open(filename, 'w', encoding='utf-8') as op:
             for r in rows:
                 op.write(r)

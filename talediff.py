@@ -156,6 +156,14 @@ def parse_args():
         'window, and GloVe does not randomly vary the window size.'
     )
     parser.add_argument(
+        '-b',
+        '--batch-size',
+        type=int,
+        default=20_000_000,
+        help='The size of a single training batch. Default is '
+        'twenty million words.'
+    )
+    parser.add_argument(
         '-r',
         '--window-sigma',
         type=float,
@@ -204,17 +212,6 @@ def parse_args():
         'are loaded.'
     )
     parser.add_argument(
-        '-i',
-        '--number-of-iterations',
-        type=int,
-        default=1,
-        help='The number of times to resample the resulting vectors and '
-        'retrain the embeddings. The first iteration produces purely random '
-        'projections of the hessian; later iterations produce more organized '
-        'projections. More than three or four iterations appear to produce '
-        'overfitting behavior.'
-    )
-    parser.add_argument(
         '-c',
         '--save-mincount',
         type=int,
@@ -234,18 +231,20 @@ def parse_args():
         'reached. Defaults to 600,000.'
     )
     parser.add_argument(
+        '-i',
+        '--save-interval',
+        type=int,
+        default=5,
+        help='The save frequency, measured in batches. Defaults to 5, meaning '
+        'that after every five batches, a new version of vectors will be saved. '
+        'If set to zero, vectors will only be saved at the end of the process.'
+    )
+    parser.add_argument(
         '--test-hessian',
         action='store_true',
         default=False,
         help='Rather than training a model, perform a battery of tests to the '
         'hessian-generating code.'
-    )
-    parser.add_argument(
-        '-d',
-        '--demo',
-        action='store_true',
-        default=False,
-        help='Display demo output after every iteration.'
     )
     parser.add_argument(
         '-e',
@@ -254,21 +253,18 @@ def parse_args():
         default=False,
         help='Execute the GloVe evaluation script on saved vectors.'
     )
-
     parser.add_argument(
         '-v',
         '--eval-mode',
         default='1',
         choices=['1', 'log', '1log', 'scalefree',
-                 '1scalefree', 'unitscalefree'],
+                 '1scalefree', 'unitscalefree', 'lognorm'],
         type=str,
         help='Mode for selecting a point in expressivity space for evaluating '
         'the jacobian and hessian. Defaults to the one-point (1, 1, 1, ...). '
     )
 
     args = parser.parse_args()
-    if not args.demo and not args.evaluate:
-        args.demo = True
 
     return args
 
@@ -308,58 +304,37 @@ def main(args):
 
     print('Creating a {}-dimension base embedding.'.format(emb.n_bits))
 
-    n_iters = args.number_of_iterations
-    for i in range(n_iters):
-        print('Iteration {}...'.format(i))
-        if i > 0:
-            emb.step_embedding()
+    n_words = 0
 
-        n_words = 0
+    batch_size = args.batch_size // args.window_size
+    batches = batch_doc_iter(textdir,
+                             args.window_size,
+                             args.window_sigma,
+                             args.number_of_windows,
+                             batch_size)
 
-        # Eatch batch should contain roughly 20 million words.
-        batch_size = 20000000 // args.window_size
-        batches = batch_doc_iter(textdir,
-                                 args.window_size,
-                                 args.window_sigma,
-                                 args.number_of_windows,
-                                 batch_size)
+    for batch_n, batch in enumerate(batches):
+        print(' Batch {}...'.format(batch_n))
 
-        for batch_n, batch in enumerate(batches):
-            print(' Batch {}...'.format(batch_n))
+        emb.overwrite_docarray(batch)
+        emb.train_multi(cosine_norm=args.cosine_norm,
+                        arithmetic_norm=args.arithmetic_norm,
+                        geometric_scaling=args.geometric_scaling)
 
-            emb.overwrite_docarray(batch)
-            emb.train_multi(cosine_norm=args.cosine_norm,
-                            arithmetic_norm=args.arithmetic_norm,
-                            geometric_scaling=args.geometric_scaling)
-
-            n_words += batch_size * args.window_size
-            print(' {} tokens processed'.format(n_words))
-            # if batch_n and not batch_n % 5:
-            if True:
-                emb.save_vectors('vectors.txt',
-                                 mincount=args.save_mincount)
-                emb.save_vocab('vocab.txt', mincount=args.save_mincount)
-                if args.evaluate:
-                    subprocess.run(['python', 'eval/python/evaluate.py'])
-
-        if args.demo:
-            demo_out(emb, i)
+        n_words += batch_size * args.window_size
+        print(' {} tokens processed'.format(n_words))
+        if args.save_interval > 0 and batch_n and not batch_n % args.save_interval:
+            emb.save_vectors('vectors.txt',
+                             mincount=args.save_mincount)
+            emb.save_vocab('vocab.txt', mincount=args.save_mincount)
+            if args.evaluate:
+                subprocess.run(['python', 'eval/python/evaluate.py'])
 
     emb.save_vectors('vectors.txt',
                      mincount=args.save_mincount)
     emb.save_vocab('vocab.txt', mincount=args.save_mincount)
     if args.evaluate:
         subprocess.run(['python', 'eval/python/evaluate.py'])
-
-    # Feature selection expiriments:
-
-    # selection_sample = doc_iter(textdir,
-    #                             args.window_size,
-    #                             args.window_sigma,
-    #                             False,
-    #                             100000)
-
-    # util.select_vectors(selection_sample, emb, 4)
 
 
 if __name__ == '__main__':
