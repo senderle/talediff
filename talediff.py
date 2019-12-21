@@ -258,7 +258,7 @@ def parse_args():
         '--eval-mode',
         default='1',
         choices=['1', 'log', '1log', 'scalefree',
-                 '1scalefree', 'unitscalefree', 'lognorm'],
+                 '1scalefree', 'unitscalefree', 'lognorm', 'wordnet'],
         type=str,
         help='Mode for selecting a point in expressivity space for evaluating '
         'the jacobian and hessian. Defaults to the one-point (1, 1, 1, ...). '

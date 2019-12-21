@@ -1,13 +1,13 @@
 import numpy
 import multiprocessing
-
 import ctypes
-
-import psutil
 
 from collections import Counter
 from collections import abc
 from itertools import islice
+
+import psutil
+from nltk.corpus import wordnet
 
 import util
 
@@ -276,6 +276,10 @@ class DocArray(abc.Sequence):
                         numpy.exp(
                             sq_word_prob_sum -
                             self._word_count[ix] / word_count_total)
+                elif self.eval_mode == 'wordnet':
+                    self._word_weight[ix] = \
+                        numpy.log10(len(wordnet.synsets(self.words[ix])) + 1) / 5 + 1
+                        # len(wordnet.synsets(self.words[ix])) / 100 + 1
                 elif self.eval_mode == 'lognorm':
                     approx_rank = int(0.035 / (self._word_count[ix] / word_count_total)) + 1
                     sigma = 1.2
@@ -307,6 +311,12 @@ class DocArray(abc.Sequence):
             self._ends.extend(ends + len(self._indices))
             self._indices.extend(indices)
             self._counts.extend(counts)
+
+            print('  Word weights after new words added:')
+            print('    weight max: ', self._word_weight.array.ravel().max())
+            print('    weight min: ', self._word_weight.array.ravel().min())
+            print('    weight avg: ', self._word_weight.array.ravel().mean())
+            print()
 
     def overwrite(self, documents):
         self.empty_docs()
@@ -539,14 +549,6 @@ class Embedding(object):
         self.jacobian_vector[:len(old_jac)] = old_jac
         self.fout[0] = old_fout
         self.n_batches_complete = old_n_batches
-
-    def step_embedding(self):
-        raise NotImplementedError('Iterated embedding is not '
-                                  'currently supported')
-        # self.hash_iter_vectors = self._sparsify_embedding()
-        # if hasattr(self, 'jacobian_vector'):
-        #     self.hash_iter_vectors /= self.jacobian_vector[:, None]
-        # self._erase_on_reset = True
 
     def _reset_embedding(self):
         if self._erase_on_reset:
