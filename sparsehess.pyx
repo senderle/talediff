@@ -168,114 +168,7 @@ cdef void cy_train_chunk_combined(
 @cython.boundscheck(False)
 @cython.cdivision(True)
 @cython.wraparound(False)
-cdef void cy_train_chunk_configurable_scaling(
-        long[:] ends,
-        long[:] indices,
-        double[:] counts,
-        double[:] totals,
-        double[:] weights,
-        double[:] jacobian,
-        double[:, :] rand_hess,
-        double[:, :] hash_vecs,
-        double geometric_scaling,
-        int arithmetic_norm) nogil:
-
-    # Memorably named temp variables.
-    cdef double len_doc_recip = 0
-    cdef double poly_pow = 0
-    cdef double jac_i = 0
-    cdef double jac_i_norm = 0
-    cdef double counts_i = 0
-    cdef double totals_i = 0
-    cdef double weights_i = 0
-    cdef double hess_i_j = 0
-    cdef double embed_dot = 0
-
-    # Boundaries and index variables.
-    cdef long n_docs = ends.shape[0]
-    cdef long start = 0
-    cdef long end = 0
-    cdef long hess_size = 0
-    cdef long embed_size = hash_vecs.shape[1]
-    cdef long i, j, k, w_i, w_j, doc_ix
-
-    # This performs almost the same operation as the above function
-    # `cy_train_chunk_combined`, but provides several configurable
-    # behaviors. Most notes are omitted entirely; for documentation, see
-    # above comments.
-
-    for doc_ix in range(n_docs):
-        end = ends[doc_ix]
-        hess_size = end - start
-
-        len_doc_recip = 0
-        for i in range(hess_size):
-            len_doc_recip += counts[start + i]
-
-        if len_doc_recip < 2:
-            continue
-
-        len_doc_recip = 1 / (len_doc_recip ** geometric_scaling)
-
-        poly_pow = 0
-        for i in range(hess_size):
-            poly_pow = poly_pow + log(weights[start + i]) * counts[start + i]
-
-        for i in range(hess_size):
-            w_i = indices[start + i]
-            counts_i = counts[start + i]
-            totals_i = totals[start + i]
-            weights_i = weights[start + i]
-
-            jac_i = (poly_pow +
-                     log(counts_i) -
-                     log(weights_i))
-
-            # Geometric scaling is applied to both the jacobian and hessian.
-            # Multiplying because we're still in log space.
-            # jac_i_norm = jac_i * len_doc_recip
-            jac_i_norm = jac_i * geometric_scaling
-
-            jacobian[w_i] = (jacobian[w_i] +
-                             exp(jac_i_norm))
-
-            for j in range(hess_size):
-                hess_i_j = exp(jac_i +
-                               log(counts[start + j]) -
-                               log(weights[start + j]))
-
-                if i == j:
-                    hess_i_j *= (counts_i - 1) / counts_i
-
-                # Geometric scaling; out of log space so it's a power now.
-                # Note that when I replaced this with a simple square root,
-                # everything worked about as well as the best
-                # geometric_scaling parameter, and with all other settings
-                # exactly the same. There is a chance this is just a very
-                # elaborate way of taking the square root... but I don't
-                # understand why we would need to take the square root,
-                # whereas the geometric mean seems somewhat reasonable.
-                # hess_i_j = hess_i_j ** len_doc_recip
-                hess_i_j = hess_i_j ** geometric_scaling
-
-                if arithmetic_norm > 0:
-                    hess_i_j = hess_i_j / totals_i
-                if isnan(hess_i_j) or isinf(hess_i_j):
-                    continue
-
-                w_j = indices[start + j]
-                for k in range(embed_size):
-                    embed_dot = (rand_hess[w_i, k] +
-                                 hess_i_j *
-                                 hash_vecs[w_j, k])
-                    rand_hess[w_i, k] = embed_dot
-
-        start = end
-
-@cython.boundscheck(False)
-@cython.cdivision(True)
-@cython.wraparound(False)
-cdef void cy_train_chunk_vanilla_full(
+cdef long cy_train_chunk_vanilla_full(
         double[:] fout,
         double[:] jacobian,
         double[:, :] rand_hess,
@@ -301,6 +194,7 @@ cdef void cy_train_chunk_vanilla_full(
     cdef long start = 0
     cdef long end = 0
     cdef long hess_size = 0
+    cdef long err_count = 0
     cdef long embed_size = hash_vecs.shape[1]
     cdef long i, j, k, w_i, w_j, doc_ix
 
@@ -356,6 +250,7 @@ cdef void cy_train_chunk_vanilla_full(
 
                 # Drop unexpected NANs.
                 if isnan(hess_i_j) or isinf(hess_i_j):
+                    err_count += 1
                     continue
 
                 # Perform the random projection.
@@ -367,6 +262,8 @@ cdef void cy_train_chunk_vanilla_full(
                     rand_hess[w_i, k] = embed_dot
 
         start = end
+
+    return err_count
 
 @cython.boundscheck(False)
 @cython.cdivision(True)
@@ -476,8 +373,6 @@ cdef void cy_train_chunk_exponential_full(
                     rand_hess[w_i, k] = embed_dot
 
         start = end
-
-
 
 @cython.boundscheck(False)
 @cython.cdivision(True)
@@ -589,41 +484,6 @@ def train_chunk_cy(docarray, hash_vectors):
     nonzero_ix = random_hessian_projection.sum(axis=1) > 0
     return random_hessian_projection[nonzero_ix], nonzero_ix.nonzero()
 
-def train_chunk_configurable_scaling(docarray,
-                                     hash_vectors,
-                                     random_hessian_projection_out,
-                                     random_hessian_projection_buf,
-                                     jacobian_out,
-                                     jacobian_buf,
-                                     geometric_scaling,
-                                     arithmetic_norm=False,
-                                     cosine_norm=False):
-    ends, indices, counts, totals, weights = docarray.features()
-    n_docs = len(ends)
-    random_hessian_projection = numpy.zeros(hash_vectors.shape,
-                                            dtype=numpy.float64)
-    jacobian = numpy.zeros(hash_vectors.shape[0], dtype=numpy.float64)
-
-    arithmetic_norm = int(bool(arithmetic_norm))
-    cy_train_chunk_configurable_scaling(ends, indices, counts,
-                                        totals, weights,
-                                        jacobian, random_hessian_projection,
-                                        hash_vectors, geometric_scaling,
-                                        arithmetic_norm)
-
-    if cosine_norm:
-        embed_norm = (random_hessian_projection *
-                      random_hessian_projection).sum(axis=1)[:, None] ** 0.5
-        embed_norm[embed_norm == 0] = 1
-        random_hessian_projection /= embed_norm
-    random_hessian_projection /= n_docs * 10000
-
-    with random_hessian_projection_buf.get_lock():
-        random_hessian_projection_out += random_hessian_projection
-
-    with jacobian_buf.get_lock():
-        jacobian_out += jacobian
-
 def train_chunk_vanilla_full(docarray,
                              hash_vectors,
                              fout_out,
@@ -641,9 +501,9 @@ def train_chunk_vanilla_full(docarray,
     jacobian = numpy.zeros(hash_vectors.shape[0], dtype=numpy.float64)
 
 
-    cy_train_chunk_vanilla_full(fout, jacobian, random_hessian_projection,
-                                ends, indices, counts, totals, weights,
-                                hash_vectors)
+    err_count = cy_train_chunk_vanilla_full(fout, jacobian, random_hessian_projection,
+                                            ends, indices, counts, totals, weights,
+                                            hash_vectors)
 
     with fout_buf.get_lock():
         fout_out += fout
@@ -653,6 +513,8 @@ def train_chunk_vanilla_full(docarray,
 
     with random_hessian_projection_buf.get_lock():
         random_hessian_projection_out += random_hessian_projection
+
+    return err_count
 
 def train_chunk_exponential_full(docarray,
                                  hash_vectors,

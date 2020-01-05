@@ -72,9 +72,13 @@ class ExtendWrap(abc.Sequence):
         self._len = new_len
 
 class DocArray(abc.Sequence):
-    def __init__(self, documents=None, eval_mode='', flatten_counts=False,
-                 multiplier=10, sparsifier=-1, max_vocab=500000):
-        self.eval_mode = eval_mode
+    def __init__(self, documents=None, ambiguity_vector='', 
+                 ambiguity_scale=1.0 / 3, ambiguity_base=1.0,
+                 flatten_counts=False, multiplier=10, 
+                 sparsifier=-1, max_vocab=500000):
+        self.ambiguity_vector = ambiguity_vector
+        self.ambiguity_scale = ambiguity_scale
+        self.ambiguity_base = ambiguity_base
         self.flatten_counts = flatten_counts
         self.multiplier = multiplier
         self.sparsifier = sparsifier
@@ -144,7 +148,7 @@ class DocArray(abc.Sequence):
         return left
 
     def inherit_settings(self, docarray):
-        self.eval_mode = docarray.eval_mode
+        self.ambiguity_vector = docarray.ambiguity_vector
         self.flatten_counts = docarray.flatten_counts
         self.multiplier = docarray.multiplier
         self.sparsifier = docarray.sparsifier
@@ -255,48 +259,31 @@ class DocArray(abc.Sequence):
 
             for ix, ct in total.items():
                 self._word_count[ix] += ct
-                if self.eval_mode == 'log':
-                    self._word_weight[ix] = \
-                        numpy.log10(self._word_count[ix]) + 1
-                elif self.eval_mode == '1log':
-                    self._word_weight[ix] = \
-                        1 / (numpy.log10(self._word_count[ix]) + 1)
-                elif self.eval_mode == 'unitscalefree':
-                    self._word_weight[ix] = \
-                        numpy.exp(
-                            self._word_count[ix] / word_count_total -
-                            mean_word_freq / word_count_total)
-                elif self.eval_mode == 'scalefree':
-                    self._word_weight[ix] = \
-                        numpy.exp(
-                            self._word_count[ix] / word_count_total -
-                            sq_word_prob_sum)
-                elif self.eval_mode == '1scalefree':
-                    self._word_weight[ix] = \
-                        numpy.exp(
-                            sq_word_prob_sum -
-                            self._word_count[ix] / word_count_total)
-                elif self.eval_mode == 'wordnet':
-                    self._word_weight[ix] = \
-                        numpy.log10(len(wordnet.synsets(self.words[ix])) + 1) / 5 + 1
-                        # len(wordnet.synsets(self.words[ix])) / 100 + 1
-                elif self.eval_mode == 'lognorm':
-                    approx_rank = int(0.035 / (self._word_count[ix] / word_count_total)) + 1
-                    sigma = 1.2
-                    mu = 8
-                    amp = 3
-                    base = 0.9
-                    lognormal_scale = amp / ((approx_rank * 2 * sigma * numpy.pi) ** 0.5)
-                    self._word_weight[ix] = base + \
-                        numpy.exp(-((numpy.log(approx_rank) - mu) ** 2) /
-                                  (2 * sigma ** 2)) * lognormal_scale
-                elif self.eval_mode == '_test':
-                    self._word_weight[ix] = \
-                        numpy.exp(
-                            self._word_count[ix] / word_count_total -
-                            sq_word_prob_sum)
-                elif self.eval_mode in ('', '1', 'one'):
+
+            # Only update word weights for new words.
+            to_update = [ix for ix, ct in total.items() 
+                         if self._word_weight[ix] <= 0]
+
+            if self.ambiguity_vector in ('', '1', 'one'):
+                for ix in to_update:
                     self._word_weight[ix] = 1
+            elif self.ambiguity_vector == 'scalefree':
+                for ix in to_update:
+                    self._word_weight[ix] = \
+                        numpy.exp(self._word_count[ix] / word_count_total -
+                                  sq_word_prob_sum)
+            else:
+                if self.ambiguity_vector == 'log':
+                    values = [numpy.log10(self._word_count[ix]) * self.ambiguity_scale + 1
+                              for ix in to_update]
+                elif self.ambiguity_vector == 'wordnet':
+                    synset_lens = (len(wordnet.synsets(self.words[ix]))
+                                   for ix in to_update)
+                    values = [numpy.log10(syn_len + 1) * self.ambiguity_scale + 1
+                              for syn_len in synset_lens]
+
+                for ix, val in zip(to_update, values):
+                    self._word_weight[ix] = val
 
             indices, counts = zip(*[i_c
                                     for doc in document_counts
@@ -454,24 +441,13 @@ class DocArray(abc.Sequence):
 # be in the global namespace of this module.
 
 def train_chunk_multi(slice):
-    # util.train_chunk_configurable_scaling(
-    #     MP_DOC_ARRAY[slice], MP_HASH_VECS,
-    #     MP_EMBED_OUT, MP_EMBED_BUF,
-    #     MP_JACOB_OUT, MP_JACOB_BUF,
-    #     MP_GEOM_SCALE, MP_ARITH_NORM,
-    #     MP_COSINE_NORM)
-    util.train_chunk_vanilla_full(
+    err_count = util.train_chunk_vanilla_full(
         MP_DOC_ARRAY[slice], MP_HASH_VECS,
         MP_FOUT_OUT, MP_FOUT_BUF,
         MP_JACOB_OUT, MP_JACOB_BUF,
         MP_EMBED_OUT, MP_EMBED_BUF)
-    # util.train_chunk_exponential_full(
-    #     MP_DOC_ARRAY[slice], MP_HASH_VECS,
-    #     MP_FOUT_OUT, MP_FOUT_BUF,
-    #     MP_JACOB_OUT, MP_JACOB_BUF,
-    #     MP_EMBED_OUT, MP_EMBED_BUF)
-
-
+    if err_count > 0:
+        print("Number of NAN values returned:", err_count)
 
 class Embedding(object):
     def __init__(self, docarray=None):
@@ -695,9 +671,7 @@ class Embedding(object):
         return iter(chunkslicer, ())
 
     def train_multi(self,
-                    cosine_norm=False,
-                    arithmetic_norm=False,
-                    geometric_scaling=1):
+                    cosine_norm=False):
         self._reset_embedding()
 
         chunksize, n_procs = self._chunkparams(self.hash_iter_vectors.shape)
@@ -716,8 +690,6 @@ class Embedding(object):
         MP_JACOB_BUF = self.jacobian_vector_buffer
         MP_EMBED_OUT = self.embed_vectors
         MP_EMBED_BUF = self.embed_vectors_buffer
-        MP_GEOM_SCALE = geometric_scaling
-        MP_ARITH_NORM = arithmetic_norm
         MP_COSINE_NORM = cosine_norm
 
         slices = (slice(i, i + chunksize)
@@ -804,7 +776,7 @@ class Embedding(object):
         print()
         print()
 
-    def _save_wordlist(self, mincount, max_vocab, out_vocab):
+    def _save_wordlist(self, mincount, out_vocab):
         tot = self.docarray._word_count
         wix = self.docarray.word_index
         words = sorted(self.docarray.words,
@@ -815,15 +787,14 @@ class Embedding(object):
                  wix[w] != (self.docarray.max_vocab - 1)]
         return words[:out_vocab]
 
-    def save_vectors(self, filename, mincount=10):
+    def save_vectors(self, filename, mincount=10, n_words=400_000):
         wix = self.docarray.word_index
-        words = self._save_wordlist(mincount, self.docarray.max_vocab, 400000)
+        words = self._save_wordlist(mincount, n_words)
 
         embed_vectors = self.embed_vectors_accumulated.astype(numpy.float16)
         vecs = (embed_vectors[wix[w]] for w in words)
 
         sample_vec = embed_vectors[wix[words[0]]]
-        print('Final vector size: {} dimensions'.format(len(sample_vec)))
 
         rows = ('{} {}\n'.format(w, ' '.join(str(v) for v in vec))
                 for w, vec in zip(words, vecs))
@@ -834,10 +805,10 @@ class Embedding(object):
 
         return dict(zip(words, vecs))
 
-    def save_vocab(self, filename, mincount=10):
+    def save_vocab(self, filename, mincount=10, n_words=400_000):
         tot = self.docarray._word_count
         wix = self.docarray.word_index
-        words = self._save_wordlist(mincount, self.docarray.max_vocab, 400000)
+        words = self._save_wordlist(mincount, n_words)
 
         rows = ('{} {}\n'.format(w, tot[wix[w]]) for w in words)
         with open(filename, 'w', encoding='utf-8') as op:

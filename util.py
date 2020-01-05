@@ -11,7 +11,6 @@ from sklearn.linear_model import SGDClassifier
 
 
 from sparsehess import block_logspace_hessian as block_logspace_hessian_sp
-from sparsehess import train_chunk_configurable_scaling
 from sparsehess import train_chunk_exponential_full
 from sparsehess import train_chunk_vanilla_full
 
@@ -19,8 +18,7 @@ from sparsehess import train_chunk_vanilla_full
 # via this one. No other module should directly refer to the `sparsehess`
 # module.
 
-_NO_WARN = (train_chunk_configurable_scaling, 
-            train_chunk_exponential_full,
+_NO_WARN = (train_chunk_exponential_full,
             train_chunk_vanilla_full)
 
 # A heisenbug occurred here. `set` produced random orderings of
@@ -538,3 +536,104 @@ def test_hessians():
         print("than 0.001 for more than twenty or thirty tests.")
     else:
         print("All hessian tests passed!")
+
+def demo_out(emb, iteration, testword=None):
+    print()
+    print('**** Iteration {} ****'.format(iteration))
+
+    print()
+    if testword is not None:
+        if testword not in emb.docarray.word_index:
+            print('Test word does not appear frequently enough in the corpus')
+        else:
+            print('Euclidean distance to test word')
+            print(emb.closest_words(testword, n_words=50,
+                                    euclidean=True, mincount=1))
+
+            print()
+            print('Cosine similarity to test word')
+            print(emb.closest_words(testword, n_words=50, mincount=1))
+
+            print()
+            print('Sample vectors')
+            print()
+            print(testword + ':')
+            print(emb.get_vec(testword))
+
+    print()
+    print('Interpretable dimensions?')
+    print()
+    print(emb.interpret_dimension(0, n_words=20, mincount=500))
+    print(emb.interpret_dimension(1, n_words=20, mincount=500))
+    print(emb.interpret_dimension(2, n_words=20, mincount=500))
+
+    print()
+    print('Analogy tests')
+    print()
+    if all(w in emb.docarray.word_index for w in ['arm', 'kick', 'leg']):
+        print()
+        print('Goal: arm movement; euclidean distance.')
+        print(emb.analogy(
+            positive=['arm', 'kick'],
+            negative=['leg'],
+            n_words=50,
+            euclidean=True,
+            mincount=1
+        ))
+
+        print()
+        print('Goal: arm movement; cosine similarity.')
+        print(emb.analogy(
+            positive=['arm', 'kick'],
+            negative=['leg'],
+            n_words=50,
+            mincount=1
+        ))
+    else:
+        print('Arm movement analogy words do not appear '
+              'frequently enough in the corpus')
+
+    if all(w in emb.docarray.word_index for w in ['fleet', 'general', 'army']):
+        print()
+        print('Goal: pilot, captain, or admiral; euclidean distance.')
+        print(emb.analogy(
+            positive=['fleet', 'general'],
+            negative=['army'],
+            n_words=50,
+            euclidean=True,
+            mincount=1
+        ))
+
+        print()
+        print('Goal: pilot, captain, or admiral; cosine similarity.')
+        print(emb.analogy(
+            positive=['fleet', 'general'],
+            negative=['army'],
+            n_words=50,
+            mincount=1
+        ))
+    else:
+        print('Naval officer analogy words do not appear '
+              'frequently enoguh in the corpus')
+
+    if all(w in emb.docarray.word_index for w in ['rey', 'han', 'kylo']):
+        print()
+        print('Goal: Rey\'s father; euclidean similarity.')
+        print(emb.analogy(
+            positive=['rey', 'han'],
+            negative=['kylo'],
+            n_words=50,
+            euclidean=True,
+            mincount=1
+        ))
+
+        print()
+        print('Goal: Rey\'s father; cosine similarity.')
+        print(emb.analogy(
+            positive=['rey', 'han'],
+            negative=['kylo'],
+            n_words=50,
+            mincount=1
+        ))
+
+    print()

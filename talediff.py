@@ -8,107 +8,6 @@ from docembed import Embedding
 
 import util
 
-def demo_out(emb, iteration, testword=None):
-    print()
-    print('**** Iteration {} ****'.format(iteration))
-
-    print()
-    if testword is not None:
-        if testword not in emb.docarray.word_index:
-            print('Test word does not appear frequently enough in the corpus')
-        else:
-            print('Euclidean distance to test word')
-            print(emb.closest_words(testword, n_words=50,
-                                    euclidean=True, mincount=1))
-
-            print()
-            print('Cosine similarity to test word')
-            print(emb.closest_words(testword, n_words=50, mincount=1))
-
-            print()
-            print('Sample vectors')
-            print()
-            print(testword + ':')
-            print(emb.get_vec(testword))
-
-    print()
-    print('Interpretable dimensions?')
-    print()
-    print(emb.interpret_dimension(0, n_words=20, mincount=500))
-    print(emb.interpret_dimension(1, n_words=20, mincount=500))
-    print(emb.interpret_dimension(2, n_words=20, mincount=500))
-
-    print()
-    print('Analogy tests')
-    print()
-    if all(w in emb.docarray.word_index for w in ['arm', 'kick', 'leg']):
-        print()
-        print('Goal: arm movement; euclidean distance.')
-        print(emb.analogy(
-            positive=['arm', 'kick'],
-            negative=['leg'],
-            n_words=50,
-            euclidean=True,
-            mincount=1
-        ))
-
-        print()
-        print('Goal: arm movement; cosine similarity.')
-        print(emb.analogy(
-            positive=['arm', 'kick'],
-            negative=['leg'],
-            n_words=50,
-            mincount=1
-        ))
-    else:
-        print('Arm movement analogy words do not appear '
-              'frequently enough in the corpus')
-
-    if all(w in emb.docarray.word_index for w in ['fleet', 'general', 'army']):
-        print()
-        print('Goal: pilot, captain, or admiral; euclidean distance.')
-        print(emb.analogy(
-            positive=['fleet', 'general'],
-            negative=['army'],
-            n_words=50,
-            euclidean=True,
-            mincount=1
-        ))
-
-        print()
-        print('Goal: pilot, captain, or admiral; cosine similarity.')
-        print(emb.analogy(
-            positive=['fleet', 'general'],
-            negative=['army'],
-            n_words=50,
-            mincount=1
-        ))
-    else:
-        print('Naval officer analogy words do not appear '
-              'frequently enoguh in the corpus')
-
-    if all(w in emb.docarray.word_index for w in ['rey', 'han', 'kylo']):
-        print()
-        print('Goal: Rey\'s father; euclidean similarity.')
-        print(emb.analogy(
-            positive=['rey', 'han'],
-            negative=['kylo'],
-            n_words=50,
-            euclidean=True,
-            mincount=1
-        ))
-
-        print()
-        print('Goal: Rey\'s father; cosine similarity.')
-        print(emb.analogy(
-            positive=['rey', 'han'],
-            negative=['kylo'],
-            n_words=50,
-            mincount=1
-        ))
-
-    print()
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description='A prototype word embedding model based on type-level '
@@ -119,29 +18,11 @@ def parse_args():
         help='A directory containing text files for training a model.'
     )
     parser.add_argument(
-        '--arithmetic-norm',
-        action='store_true',
-        default=False,
-        help='Use arithmetic normalization.'
-    )
-    parser.add_argument(
         '-C',
         '--cosine-norm',
         action='store_true',
         default=False,
         help='Normalize results using cosine distance after every batch.'
-    )
-    parser.add_argument(
-        '-g',
-        '--geometric-scaling',
-        type=float,
-        default=1,
-        help='A geometric scaling factor. A value of 0 is equivalent to an '
-        'ordinary power of the terms for a sentence, while a value of 1 is '
-        'equivalent to the geometric mean of the terms. Since sentence '
-        'length may vary, nonzero values smooth out variation. But they also '
-        'have subtle effects on the way the hessian approximates '
-        'nonlinearities caused by repeated terms. Defaults to 1.'
     )
     parser.add_argument(
         '-w',
@@ -193,17 +74,6 @@ def parse_args():
         'of dimensions is equal to 64 * multiplier * sparsifier.'
     )
     parser.add_argument(
-        '-s',
-        '--hash-vector-sparsifier',
-        type=int,
-        default=-1,
-        help='A parameter that "stretches" the hash vectors by padding them '
-        'with evenly spaced zeros. This may help model interpretability. See '
-        '--hash-vector-multiplier as well. A value less than zero indicates '
-        'dense vectors of positive and negative values, instead of ones and '
-        'zeros (the default behavior).'
-    )
-    parser.add_argument(
         '-n',
         '--number-of-windows',
         type=int,
@@ -222,13 +92,23 @@ def parse_args():
         'using hutter8 data.'
     )
     parser.add_argument(
-        '-V',
+        '-M',
         '--max-vocab',
         type=int,
-        default=600000,
+        default=600_000,
         help='The maximum number of terms to include in the vocabulary. Words '
         'are added on a "first-come-first-serve" basis until this number is '
         'reached. Defaults to 600,000.'
+    )
+    parser.add_argument(
+        '-V',
+        '--save-vocab',
+        type=int,
+        default=300_000,
+        help='The maximum number of terms to include in the output. This is '
+        'distinct from --max-vocab; given --max-vocab 600000 and '
+        '--save-vocab 300000, the 300,000 least common words are simply '
+        'thrown out. Defaults to 300,000.'
     )
     parser.add_argument(
         '-i',
@@ -255,13 +135,26 @@ def parse_args():
     )
     parser.add_argument(
         '-v',
-        '--eval-mode',
+        '--ambiguity-vector',
         default='1',
-        choices=['1', 'log', '1log', 'scalefree',
-                 '1scalefree', 'unitscalefree', 'lognorm', 'wordnet'],
+        choices=['1', 'log', 'scalefree', 'wordnet'],
         type=str,
-        help='Mode for selecting a point in expressivity space for evaluating '
+        help='Method for selecting a point in ambiguity space for evaluating '
         'the jacobian and hessian. Defaults to the one-point (1, 1, 1, ...). '
+    )
+    parser.add_argument(
+        '-S', 
+        '--ambiguity-scale',
+        default=1.0 / 3,
+        type=float,
+        help='A scaling factor for the ambiguity vector.'
+    )
+    parser.add_argument(
+        '-B', 
+        '--ambiguity-base',
+        default=1.0,
+        type=float,
+        help='The minimum value for the ambiguity vector.'
     )
 
     args = parser.parse_args()
@@ -296,10 +189,11 @@ def batch_doc_iter(textdir, window_size, window_sigma,
 
 def main(args):
     textdir = args.text_directory
-    emb = Embedding(DocArray(eval_mode=args.eval_mode,
+    emb = Embedding(DocArray(ambiguity_vector=args.ambiguity_vector,
+                             ambiguity_scale=args.ambiguity_scale,
+                             ambiguity_base=args.ambiguity_base,
                              flatten_counts=args.flatten_counts,
                              multiplier=args.hash_vector_multiplier,
-                             sparsifier=args.hash_vector_sparsifier,
                              max_vocab=args.max_vocab))
 
     print('Creating a {}-dimension base embedding.'.format(emb.n_bits))
@@ -317,22 +211,27 @@ def main(args):
         print(' Batch {}...'.format(batch_n))
 
         emb.overwrite_docarray(batch)
-        emb.train_multi(cosine_norm=args.cosine_norm,
-                        arithmetic_norm=args.arithmetic_norm,
-                        geometric_scaling=args.geometric_scaling)
+        emb.train_multi(cosine_norm=args.cosine_norm)
 
         n_words += batch_size * args.window_size
         print(' {} tokens processed'.format(n_words))
         if args.save_interval > 0 and batch_n and not batch_n % args.save_interval:
             emb.save_vectors('vectors.txt',
-                             mincount=args.save_mincount)
-            emb.save_vocab('vocab.txt', mincount=args.save_mincount)
+                             mincount=args.save_mincount,
+                             n_words=args.save_vocab)
+            emb.save_vocab('vocab.txt', 
+                           mincount=args.save_mincount,
+                           n_words=args.save_vocab)
             if args.evaluate:
                 subprocess.run(['python', 'eval/python/evaluate.py'])
 
-    emb.save_vectors('vectors.txt',
-                     mincount=args.save_mincount)
-    emb.save_vocab('vocab.txt', mincount=args.save_mincount)
+        emb.save_vectors('vectors.txt',
+                         mincount=args.save_mincount,
+                         n_words=args.save_vocab)
+        emb.save_vocab('vocab.txt', 
+                       mincount=args.save_mincount,
+                       n_words=args.save_vocab)
+
     if args.evaluate:
         subprocess.run(['python', 'eval/python/evaluate.py'])
 
