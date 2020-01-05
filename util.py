@@ -129,7 +129,8 @@ def sparsify_rows(matrix, iters=1):
 # This is my quick-and-dirty implementation of what Ben Schmidt calls
 # "Stable Random Projection." I'm not sure it's totally correct, but
 # the idea is from him.
-def srp_matrix(words, multiplier, sparsifier=-1):
+def srp_matrix(words, dimension):
+    multiplier = (dimension - 1) // 64 + 1
     hashes = [
         list(map(hash, ['{}_{}'.format(w, i) for i in range(multiplier)]))
         for w in words
@@ -149,17 +150,8 @@ def srp_matrix(words, multiplier, sparsifier=-1):
     # by 320 bits...
 
     hash_arr = numpy.unpackbits(hash_arr.ravel()).reshape(-1, 64 * multiplier)
-
-    if sparsifier >= 0:
-        # ...or even as an array of bits, where every word is represented
-        # by 640 bits, where pairs of bits are mapped to four bits with one
-        # positive value, which ensures greater sparsity, which is what
-        # sparsify_rows does if `sparsifier` is greater than 1.
-        out = sparsify_rows(hash_arr, sparsifier).astype(numpy.float64)
-    else:
-        out = hash_arr.astype(numpy.float64) * 2 - 1
-
-    return out
+    out = hash_arr.astype(numpy.float64) * 2 - 1
+    return out[:, :dimension]
 
 def resample_vectors(vecs):
     new_vecs = numpy.empty(vecs.shape, dtype=vecs.dtype)

@@ -69,11 +69,20 @@ def evaluate_vectors(W, vocab, ivocab):
         num_iter = int(np.ceil(len(indices) / float(split_size)))
         for j in range(num_iter):
             subset = np.arange(j*split_size, min((j + 1)*split_size, len(ind1)))
-
-            pred_vec = (W[ind2[subset], :] - W[ind1[subset], :]
-                +  W[ind3[subset], :])
-            #cosine similarity if input W has been normalized
+            
+            a  = W[ind1[subset], :]
+            a_ = W[ind2[subset], :]
+            b  = W[ind3[subset], :]
+            pred_vec = a_ - a + b
+            
+            # Cosine similarity if input W has been normalized
             dist = np.dot(W, pred_vec.T)
+
+            # The above is equivalent but more efficient than this:
+            # dist = np.dot(W, a_.T) + np.dot(W, b.T) - np.dot(W, a.T)
+
+            # To use 3CosMul as descried in Levy, Goldberg, Dagan (2016):
+            # dist = (np.dot(W, a_.T) + np.dot(W, b.T)) / (np.dot(W, a.T) + 1e-10)
 
             for k in range(len(subset)):
                 dist[ind1[subset[k]], k] = -np.Inf

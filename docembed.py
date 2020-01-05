@@ -74,14 +74,13 @@ class ExtendWrap(abc.Sequence):
 class DocArray(abc.Sequence):
     def __init__(self, documents=None, ambiguity_vector='', 
                  ambiguity_scale=1.0 / 3, ambiguity_base=1.0,
-                 flatten_counts=False, multiplier=10, 
-                 sparsifier=-1, max_vocab=500000):
+                 hash_dimension=300, flatten_counts=False,
+                 max_vocab=500000):
         self.ambiguity_vector = ambiguity_vector
         self.ambiguity_scale = ambiguity_scale
         self.ambiguity_base = ambiguity_base
         self.flatten_counts = flatten_counts
-        self.multiplier = multiplier
-        self.sparsifier = sparsifier
+        self.hash_dimension = hash_dimension
         self.max_vocab = max_vocab
         self._hash_vectors = None
 
@@ -150,15 +149,13 @@ class DocArray(abc.Sequence):
     def inherit_settings(self, docarray):
         self.ambiguity_vector = docarray.ambiguity_vector
         self.flatten_counts = docarray.flatten_counts
-        self.multiplier = docarray.multiplier
-        self.sparsifier = docarray.sparsifier
+        self.hash_dimension = docarray.hash_dimension
 
     @property
     def hash_vectors(self):
         if self._hash_vectors is None:
             self._hash_vectors = util.srp_matrix(self.words[:self.max_vocab],
-                                                 self.multiplier,
-                                                 self.sparsifier)
+                                                 self.hash_dimension)
         return self._hash_vectors
 
     @property
@@ -461,8 +458,7 @@ class Embedding(object):
 
     @property
     def n_bits(self):
-        sp = max(self.docarray.sparsifier, 0)
-        return 64 * self.docarray.multiplier * 2 ** sp
+        return self.docarray.hash_dimension
 
     @property
     def hash_vectors(self):
@@ -567,14 +563,6 @@ class Embedding(object):
         vec = numpy.zeros(self.embed_vectors.shape[1])
         vec[dim] = 1
         return self.closest_words(vec, n_words, euclidean, mincount)
-
-    def _sparsify_embedding(self, use_embedding=False):
-        if use_embedding:
-            # This tries to transform the embedding into a new semi-random
-            # projection. In practice, it doesn't seem to make much difference.
-            return util.resample_vectors(self.embed_vectors)
-        else:
-            return self.hash_vectors
 
     def _svd_prep(self, U, s):
         return U[:, :len(s)], numpy.diag(s)

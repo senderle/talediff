@@ -62,16 +62,12 @@ def parse_args():
         'matrix.'
     )
     parser.add_argument(
-        '-m',
-        '--hash-vector-multiplier',
+        '-d',
+        '--dimension',
         type=int,
-        default=5,
-        help='A parameter that helps determine the length of the hash '
-        'vectors, along with --hash-vector-sparsifier, below. We generate '
-        'random binary projection vectors using the hash of the given '
-        'word; hashes are 64-bits long, so if the sparsifier is 0, then '
-        'a multiplier of 5 gives a 320-dimension vector. The total number '
-        'of dimensions is equal to 64 * multiplier * sparsifier.'
+        default=300,
+        help='The size of the hash vectors (and by extension, the output '
+        'word vectors).'
     )
     parser.add_argument(
         '-n',
@@ -192,8 +188,8 @@ def main(args):
     emb = Embedding(DocArray(ambiguity_vector=args.ambiguity_vector,
                              ambiguity_scale=args.ambiguity_scale,
                              ambiguity_base=args.ambiguity_base,
+                             hash_dimension=args.dimension,
                              flatten_counts=args.flatten_counts,
-                             multiplier=args.hash_vector_multiplier,
                              max_vocab=args.max_vocab))
 
     print('Creating a {}-dimension base embedding.'.format(emb.n_bits))
