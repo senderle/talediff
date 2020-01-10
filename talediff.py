@@ -18,6 +18,54 @@ def parse_args():
         help='A directory containing text files for training a model.'
     )
     parser.add_argument(
+        '--verbose',
+        action='store_true',
+        default=False,
+        help='Show detailed information about vectors from each batch.'
+    )
+    parser.add_argument(
+        '-d',
+        '--dimension',
+        type=int,
+        default=300,
+        help='The size of the hash vectors (and by extension, the output '
+        'word vectors).'
+    )
+    parser.add_argument(
+        '-v',
+        '--ambiguity-vector',
+        default='1',
+        choices=['1', 'log', 'scalefree', 'wordnet'],
+        type=str,
+        help='Method for selecting a point in ambiguity space for evaluating '
+        'the jacobian and hessian. Defaults to the one-point (1, 1, 1, ...). '
+    )
+    parser.add_argument(
+        '-S', 
+        '--ambiguity-scale',
+        default=1.0 / 3,
+        type=float,
+        help='A scaling factor for the ambiguity vector.'
+    )
+    parser.add_argument(
+        '-B', 
+        '--ambiguity-base',
+        default=1.0,
+        type=float,
+        help='The minimum value for the ambiguity vector.'
+    )
+    parser.add_argument(
+        '-D',
+        '--downsample-threshold',
+        default=1.0,
+        type=float,
+        help='Words that occur with a probability greater than this '
+        'number will be downsampled according to the formula 1 - (t / p). '
+        'the default is 1.0, meaning that no words are downsampled. '
+        'For a typical English-language corpus, a threshold value of 1e-5 '
+        'will reduce the frequency of roughly the top 8,000 words.'
+    )
+    parser.add_argument(
         '-C',
         '--cosine-norm',
         action='store_true',
@@ -37,14 +85,6 @@ def parse_args():
         'window, and GloVe does not randomly vary the window size.'
     )
     parser.add_argument(
-        '-b',
-        '--batch-size',
-        type=int,
-        default=20_000_000,
-        help='The size of a single training batch. Default is '
-        'twenty million words.'
-    )
-    parser.add_argument(
         '-r',
         '--window-sigma',
         type=float,
@@ -53,29 +93,20 @@ def parse_args():
         'as a fraction of the window size. Defaults to 0.5'
     )
     parser.add_argument(
-        '-f',
-        '--flatten-counts',
-        action='store_true',
-        default=False,
-        help='Remove all repetitions, "flattening" the word counts for each '
-        'sentence. This gives a more standard version of the coocurrence '
-        'matrix.'
-    )
-    parser.add_argument(
-        '-d',
-        '--dimension',
-        type=int,
-        default=300,
-        help='The size of the hash vectors (and by extension, the output '
-        'word vectors).'
-    )
-    parser.add_argument(
         '-n',
         '--number-of-windows',
         type=int,
         default=0,
         help='The number of context windows to load. By default, all windows '
         'are loaded.'
+    )
+    parser.add_argument(
+        '-b',
+        '--batch-size',
+        type=int,
+        default=20_000_000,
+        help='The size of a single training batch. Default is '
+        'twenty million words.'
     )
     parser.add_argument(
         '-c',
@@ -116,13 +147,6 @@ def parse_args():
         'If set to zero, vectors will only be saved at the end of the process.'
     )
     parser.add_argument(
-        '--test-hessian',
-        action='store_true',
-        default=False,
-        help='Rather than training a model, perform a battery of tests to the '
-        'hessian-generating code.'
-    )
-    parser.add_argument(
         '-e',
         '--evaluate',
         action='store_true',
@@ -130,27 +154,11 @@ def parse_args():
         help='Execute the GloVe evaluation script on saved vectors.'
     )
     parser.add_argument(
-        '-v',
-        '--ambiguity-vector',
-        default='1',
-        choices=['1', 'log', 'scalefree', 'wordnet'],
-        type=str,
-        help='Method for selecting a point in ambiguity space for evaluating '
-        'the jacobian and hessian. Defaults to the one-point (1, 1, 1, ...). '
-    )
-    parser.add_argument(
-        '-S', 
-        '--ambiguity-scale',
-        default=1.0 / 3,
-        type=float,
-        help='A scaling factor for the ambiguity vector.'
-    )
-    parser.add_argument(
-        '-B', 
-        '--ambiguity-base',
-        default=1.0,
-        type=float,
-        help='The minimum value for the ambiguity vector.'
+        '--test-hessian',
+        action='store_true',
+        default=False,
+        help='Rather than training a model, perform a battery of tests to the '
+        'hessian-generating code.'
     )
 
     args = parser.parse_args()
@@ -185,14 +193,16 @@ def batch_doc_iter(textdir, window_size, window_sigma,
 
 def main(args):
     textdir = args.text_directory
-    emb = Embedding(DocArray(ambiguity_vector=args.ambiguity_vector,
-                             ambiguity_scale=args.ambiguity_scale,
-                             ambiguity_base=args.ambiguity_base,
-                             hash_dimension=args.dimension,
-                             flatten_counts=args.flatten_counts,
-                             max_vocab=args.max_vocab))
+    docs = DocArray(ambiguity_vector=args.ambiguity_vector,
+                    ambiguity_scale=args.ambiguity_scale,
+                    ambiguity_base=args.ambiguity_base,
+                    hash_dimension=args.dimension,
+                    max_vocab=args.max_vocab,
+                    downsample_threshold=args.downsample_threshold)
+    emb = Embedding(docs, verbose=args.verbose)
 
-    print('Creating a {}-dimension base embedding.'.format(emb.n_bits))
+    print('Creating a {}-dimension embedding.'.format(emb.n_bits))
+    print()
 
     n_words = 0
 
@@ -210,7 +220,8 @@ def main(args):
         emb.train_multi(cosine_norm=args.cosine_norm)
 
         n_words += batch_size * args.window_size
-        print(' {} tokens processed'.format(n_words))
+        print('   {} tokens processed'.format(n_words))
+        print()
         if args.save_interval > 0 and batch_n and not batch_n % args.save_interval:
             emb.save_vectors('vectors.txt',
                              mincount=args.save_mincount,

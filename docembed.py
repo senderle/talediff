@@ -74,14 +74,14 @@ class ExtendWrap(abc.Sequence):
 class DocArray(abc.Sequence):
     def __init__(self, documents=None, ambiguity_vector='', 
                  ambiguity_scale=1.0 / 3, ambiguity_base=1.0,
-                 hash_dimension=300, flatten_counts=False,
-                 max_vocab=500000):
+                 hash_dimension=300, max_vocab=500000,
+                 downsample_threshold=1.0):
         self.ambiguity_vector = ambiguity_vector
         self.ambiguity_scale = ambiguity_scale
         self.ambiguity_base = ambiguity_base
-        self.flatten_counts = flatten_counts
         self.hash_dimension = hash_dimension
         self.max_vocab = max_vocab
+        self.downsample_threshold = downsample_threshold
         self._hash_vectors = None
 
         if isinstance(documents, DocArray):
@@ -148,7 +148,6 @@ class DocArray(abc.Sequence):
 
     def inherit_settings(self, docarray):
         self.ambiguity_vector = docarray.ambiguity_vector
-        self.flatten_counts = docarray.flatten_counts
         self.hash_dimension = docarray.hash_dimension
 
     @property
@@ -248,7 +247,8 @@ class DocArray(abc.Sequence):
             document_counts = [c.items() for c in document_counters]
 
             total = Counter(wix[w] for doc in documents for w in doc)
-            self._word_count_total += sum(total.values())
+            batch_total = sum(total.values())
+            self._word_count_total += batch_total
             word_count_total = self._word_count_total
             mean_word_freq = word_count_total / len(self._word_count)
             sq_word_prob_sum = sum((c / word_count_total) ** 2
@@ -261,6 +261,7 @@ class DocArray(abc.Sequence):
             to_update = [ix for ix, ct in total.items() 
                          if self._word_weight[ix] <= 0]
 
+            # TODO: vectorize this where possible
             if self.ambiguity_vector in ('', '1', 'one'):
                 for ix in to_update:
                     self._word_weight[ix] = 1
@@ -276,30 +277,48 @@ class DocArray(abc.Sequence):
                 elif self.ambiguity_vector == 'wordnet':
                     synset_lens = (len(wordnet.synsets(self.words[ix]))
                                    for ix in to_update)
-                    values = [numpy.log10(syn_len + 1) * self.ambiguity_scale + 1
+                    values = [numpy.log10(syn_len + 1) *
+                              self.ambiguity_scale + 1
                               for syn_len in synset_lens]
-
-                for ix, val in zip(to_update, values):
-                    self._word_weight[ix] = val
+                
+                self._word_weight.array[to_update] = values
 
             indices, counts = zip(*[i_c
                                     for doc in document_counts
                                     for i_c in doc])
+            counts = numpy.array(counts, dtype=float)
             ends = numpy.cumsum([len(doc) for doc in document_counts])
 
-            # Ignore repetitions; this eliminates all nonlinearity
-            # from the polynomial.
-            if self.flatten_counts:
-                counts = [1 for x in counts]
+            if self.downsample_threshold < 1.0:
+                threshold = self.downsample_threshold
+                down_by_p = {
+                    word_i: 1 - (batch_total * threshold / total[word_i]) ** 0.5
+                    for word_i, w in enumerate(self.words[:self.max_vocab])
+                    if (total[word_i] / batch_total) > threshold
+                }
+                print('  Number of word types to be downsampled: ', len(down_by_p))
+
+                to_downsample = ((doc_i,) * int(counts[doc_i]) for doc_i in range(len(indices)) 
+                                 if indices[doc_i] in down_by_p)
+
+                to_downsample = numpy.array([doc_i for doc_i_set in to_downsample for doc_i in doc_i_set])
+                rand = numpy.random.random(len(to_downsample))
+                sample_thresh = numpy.array([down_by_p[indices[doc_i]] for doc_i in to_downsample])
+                to_downsample = to_downsample[rand < sample_thresh]
+                for doc_i in to_downsample:
+                    counts[doc_i] -= 1
+                counts[counts <= 0] = 1e-10
 
             self._ends.extend(ends + len(self._indices))
             self._indices.extend(indices)
             self._counts.extend(counts)
 
+            ww_rav = self._word_weight.array.ravel()
+            ww_max = ww_rav.max()
+            ww_min = ww_rav.min()
+            ww_avg = ww_rav.mean()
             print('  Word weights after new words added:')
-            print('    weight max: ', self._word_weight.array.ravel().max())
-            print('    weight min: ', self._word_weight.array.ravel().min())
-            print('    weight avg: ', self._word_weight.array.ravel().mean())
+            print(f'    weight max: {ww_max:.4g}  min: {ww_min:.4g}  avg: {ww_avg:.4g}')
             print()
 
     def overwrite(self, documents):
@@ -444,11 +463,13 @@ def train_chunk_multi(slice):
         MP_JACOB_OUT, MP_JACOB_BUF,
         MP_EMBED_OUT, MP_EMBED_BUF)
     if err_count > 0:
+        print()
         print("Number of NAN values returned:", err_count)
 
 class Embedding(object):
-    def __init__(self, docarray=None):
+    def __init__(self, docarray=None, verbose=False):
         self.docarray = None
+        self.verbose = verbose
         self._erase_on_reset = False
 
         if docarray is None:
@@ -645,7 +666,7 @@ class Embedding(object):
         mean_doc_length = int(self.docarray.mean_doc_length) + 1
         max_chunksize = int((mem_gigs_avail * 2 ** 23 // mean_doc_length) // n_dims)
         n_docs = len(self.docarray)
-        n_procs = multiprocessing.cpu_count()
+        n_procs = multiprocessing.cpu_count() * 2
         chunksize = n_docs // n_procs + 1
         chunksize = max(min_chunksize, chunksize)
         chunksize = min(max_chunksize, chunksize)
@@ -713,33 +734,58 @@ class Embedding(object):
         # and reports a few simple statistics to verify that everything
         # is working as expected.
 
-        print()
-        print('    Before scaling by fout:')
-        print('      embed max: ', self.embed_vectors.ravel().max())
-        print('      embed min: ', self.embed_vectors.ravel().min())
-        print('      embed avg: ', self.embed_vectors.ravel().mean())
+        fout = self.fout[0]
 
-        embed_vectors = self.embed_vectors / self.fout
-        print('    Before jacobian normalization:')
-        print('      fout: ', self.fout[0])
-        print('      embed max: ', embed_vectors.ravel().max())
-        print('      embed min: ', embed_vectors.ravel().min())
-        print('      embed avg: ', embed_vectors.ravel().mean())
+        if self.verbose:
+            ev_rav = self.embed_vectors.ravel()
+            ev_max = ev_rav.max()
+            ev_min = ev_rav.min()
+            ev_avg = ev_rav.mean()
+            print( '    Before scaling by fout:')
+            print(f'      fout: {fout}')
+            print(f'      embed max: {ev_max:.4g}')
+            print(f'      embed min: {ev_min:.4g}')
+            print(f'      embed avg: {ev_avg:.4g}')
 
-        jacobian_norm = self.jacobian_vector / self.fout
+        embed_vectors = self.embed_vectors / fout
+        
+        if self.verbose:
+            ev_rav = embed_vectors.ravel()
+            ev_max = ev_rav.max()
+            ev_min = ev_rav.min()
+            ev_avg = ev_rav.mean()
+            print( '    Before jacobian shift:')
+            print(f'      embed max: {ev_max:.4g}')
+            print(f'      embed min: {ev_min:.4g}')
+            print(f'      embed avg: {ev_avg:.4g}')
+
+        jacobian_norm = self.jacobian_vector / fout
         jacobian_rand = jacobian_norm @ self.hash_iter_vectors
         jacobian_rand = (jacobian_norm.reshape(-1, 1) @
                          jacobian_rand.reshape(1, -1))
-        print('    Jacobian normalizer:')
-        print('      jac-norm max: ', jacobian_rand.ravel().max())
-        print('      jac-norm min: ', jacobian_rand.ravel().min())
-        print('      jac-norm avg: ', jacobian_rand.ravel().mean())
+
+        if self.verbose:
+            jac_rav = jacobian_rand.ravel()
+            jac_max = jac_rav.max()
+            jac_min = jac_rav.min()
+            jac_avg = jac_rav.mean()
+            print( '    Jacobian shift matrix:')
+            print(f'      shift max: {ev_max:.4g}')
+            print(f'      shift min: {ev_min:.4g}')
+            print(f'      shift avg: {ev_avg:.4g}')
 
         embed_vectors -= jacobian_rand
-        print('    After jacobian normalization:')
-        print('      embed max: ', embed_vectors.ravel().max())
-        print('      embed min: ', embed_vectors.ravel().min())
-        print('      embed avg: ', embed_vectors.ravel().mean())
+
+        if self.verbose:
+            ev_rav = embed_vectors.ravel()
+            ev_max = ev_rav.max()
+            ev_min = ev_rav.min()
+            ev_avg = ev_rav.mean()
+            print( '    After jacobian shift:')
+            print(f'      embed max: {ev_max:.4g}')
+            print(f'      embed min: {ev_min:.4g}')
+            print(f'      embed avg: {ev_avg:.4g}')
+
 
         self.n_batches_complete += 1
         if cosine_norm:
@@ -754,14 +800,28 @@ class Embedding(object):
                 self.jacobian_vector[:] = 0
             with self.fout_buffer.get_lock():
                 self.fout[:] = 0
-            print('    Accumulated unit-normalized mean:')
-            print('      accumulated max: ', self.embed_vectors_accumulated.ravel().max())
-            print('      accumulated min: ', self.embed_vectors_accumulated.ravel().min())
-            print('      accumulated avg: ', self.embed_vectors_accumulated.ravel().mean())
+            if self.verbose:
+                ev_rav = self.embed_vectors_accumulated.ravel()
+                ev_max = ev_rav.max()
+                ev_min = ev_rav.min()
+                ev_avg = ev_rav.mean()
+                print( '    Accumulated unit-normalized mean:')
+                print(f'      embed max: {ev_max:.4g}')
+                print(f'      embed min: {ev_min:.4g}')
+                print(f'      embed avg: {ev_avg:.4g}')
         else:
             with self.embed_vectors_accumulated_buffer.get_lock():
                 self.embed_vectors_accumulated[:] = embed_vectors
-        print()
+        
+        if not self.verbose:
+            print(f'    Fout for this batch: {fout}')
+            print( '    Final embedding stats:')
+            ev_rav = self.embed_vectors_accumulated.ravel()
+            ev_max = ev_rav.max()
+            ev_min = ev_rav.min()
+            ev_avg = ev_rav.mean()
+            print(f'      embed max: {ev_max:.4g}  min: {ev_min:.4g}  avg: {ev_avg:.4g}')
+
         print()
 
     def _save_wordlist(self, mincount, out_vocab):
