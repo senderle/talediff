@@ -32,10 +32,22 @@ def parse_args():
         'word vectors).'
     )
     parser.add_argument(
+        '-p', 
+        '--projection-distribution',
+        default='binary',
+        choices=['binary', 'gaussian'],
+        type=str,
+        help='Scheme for generating a random projection matrix. By default '
+        'values from {-1, 1} are chosen according to a balanced binary '
+        'distribution. In `gaussian` mode values are sampled from a normal '
+        'distribution with a mean of 0 and a standard deviation of 1/3 '
+        '(giving ~99% of all values in the range of (-1, 1).'
+    )
+    parser.add_argument(
         '-v',
         '--ambiguity-vector',
         default='1',
-        choices=['1', 'log', 'scalefree', 'wordnet'],
+        choices=['1', 'log', 'scalefree', 'wordnet', 'wordnetds'],
         type=str,
         help='Method for selecting a point in ambiguity space for evaluating '
         'the jacobian and hessian. Defaults to the one-point (1, 1, 1, ...). '
@@ -61,9 +73,12 @@ def parse_args():
         type=float,
         help='Words that occur with a probability greater than this '
         'number will be downsampled according to the formula 1 - (t / p). '
-        'the default is 1.0, meaning that no words are downsampled. '
-        'For a typical English-language corpus, a threshold value of 1e-5 '
-        'will reduce the frequency of roughly the top 8,000 words.'
+        'The default is 1.0, meaning that no words are downsampled. '
+        'For a typical English-language corpus, this tends to reduce '
+        'the frequency of roughly the top 10 / t '
+        'words. For example, a threshold of 1e-4 will downsample '
+        'about 1000 words. In wordnetds mode, this is appplied to '
+        'the ambiguity vector instead of to the raw word frequencies.'
     )
     parser.add_argument(
         '-C',
@@ -76,9 +91,9 @@ def parse_args():
         '-w',
         '--window-size',
         type=int,
-        default=60,
+        default=50,
         help='The width of the average context window (for input that '
-        'cannot be parsed into sentences). Defaults to 60. The length of '
+        'cannot be parsed into sentences). Defaults to 50. The length of '
         'each window is sampled from a gaussian distribution with this as '
         'the mean. (For comparison, the default GloVe settings use a '
         'bidirectional 15-word window, effectively resulting in a 30-word '
@@ -90,7 +105,8 @@ def parse_args():
         type=float,
         default=0,
         help='The standard distribution of the window size distribution, '
-        'as a fraction of the window size. Defaults to 0.5'
+        'as a fraction of the window size. Defaults to 0, meaning that all '
+        'windows are the same length.'
     )
     parser.add_argument(
         '-n',
@@ -104,9 +120,9 @@ def parse_args():
         '-b',
         '--batch-size',
         type=int,
-        default=20_000_000,
+        default=50_000_000,
         help='The size of a single training batch. Default is '
-        'twenty million words.'
+        'fifty million words.'
     )
     parser.add_argument(
         '-c',
@@ -213,7 +229,7 @@ def main(args):
                              args.number_of_windows,
                              batch_size)
 
-    for batch_n, batch in enumerate(batches):
+    for batch_n, batch in enumerate(batches, start=1):
         print(' Batch {}...'.format(batch_n))
 
         emb.overwrite_docarray(batch)
@@ -222,7 +238,7 @@ def main(args):
         n_words += batch_size * args.window_size
         print('   {} tokens processed'.format(n_words))
         print()
-        if args.save_interval > 0 and batch_n and not batch_n % args.save_interval:
+        if args.save_interval > 0 and not batch_n % args.save_interval:
             emb.save_vectors('vectors.txt',
                              mincount=args.save_mincount,
                              n_words=args.save_vocab)
@@ -232,16 +248,8 @@ def main(args):
             if args.evaluate:
                 subprocess.run(['python', 'eval/python/evaluate.py'])
 
-        emb.save_vectors('vectors.txt',
-                         mincount=args.save_mincount,
-                         n_words=args.save_vocab)
-        emb.save_vocab('vocab.txt', 
-                       mincount=args.save_mincount,
-                       n_words=args.save_vocab)
-
     if args.evaluate:
         subprocess.run(['python', 'eval/python/evaluate.py'])
-
 
 if __name__ == '__main__':
     args = parse_args()

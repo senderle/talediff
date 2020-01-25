@@ -8,7 +8,7 @@ from zipfile import ZipFile
 from io import TextIOWrapper
 
 from sklearn.linear_model import SGDClassifier
-
+from pyhash import city_64
 
 from sparsehess import block_logspace_hessian as block_logspace_hessian_sp
 from sparsehess import train_chunk_exponential_full
@@ -48,9 +48,13 @@ def load_and_make_windows(txt, window_size=15):
     return sents
 
 def random_window_gen(mean, std, block_size=1000):
-    while True:
-        for v in numpy.random.normal(mean, std, block_size):
-            yield int(v)
+    if std == 0:
+        while True:
+            yield mean
+    else: 
+        while True:
+            for v in numpy.random.normal(mean, std, block_size):
+                yield int(v)
 
 def load_and_make_random_windows(txt, window_size=15,
                                  window_sigma=0.5, reps=1):
@@ -129,10 +133,10 @@ def sparsify_rows(matrix, iters=1):
 # This is my quick-and-dirty implementation of what Ben Schmidt calls
 # "Stable Random Projection." I'm not sure it's totally correct, but
 # the idea is from him.
-def srp_matrix(words, dimension):
+def srp_matrix_old(words, dimension, _hashfunc=city_64(0)):
     multiplier = (dimension - 1) // 64 + 1
     hashes = [
-        list(map(hash, ['{}_{}'.format(w, i) for i in range(multiplier)]))
+        list(map(_hashfunc, ['{}_{}'.format(w, i) for i in range(multiplier)]))
         for w in words
     ]
 
@@ -152,6 +156,15 @@ def srp_matrix(words, dimension):
     hash_arr = numpy.unpackbits(hash_arr.ravel()).reshape(-1, 64 * multiplier)
     out = hash_arr.astype(numpy.float64) * 2 - 1
     return out[:, :dimension]
+
+def srp_matrix(words, dimension, _hashfunc=city_64(0)):
+    seeds = [_hashfunc(w) & (2 ** 32 - 1) for w in words]
+    out = []
+    for s in seeds:
+        numpy.random.seed(s)
+        out.append(numpy.random.normal(0.0, 1 / 3, size=dimension))
+
+    return numpy.array(out)
 
 def resample_vectors(vecs):
     new_vecs = numpy.empty(vecs.shape, dtype=vecs.dtype)

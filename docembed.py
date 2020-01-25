@@ -246,42 +246,49 @@ class DocArray(abc.Sequence):
                                  for doc in documents]
             document_counts = [c.items() for c in document_counters]
 
-            total = Counter(wix[w] for doc in documents for w in doc)
-            batch_total = sum(total.values())
+            batch_word_count = Counter(wix[w] for doc in documents for w in doc)
+            batch_total = sum(batch_word_count.values())
             self._word_count_total += batch_total
             word_count_total = self._word_count_total
-            mean_word_freq = word_count_total / len(self._word_count)
             sq_word_prob_sum = sum((c / word_count_total) ** 2
                                    for c in self._word_count)
 
-            for ix, ct in total.items():
+            for ix, ct in batch_word_count.items():
                 self._word_count[ix] += ct
 
-            # Only update word weights for new words.
-            to_update = [ix for ix, ct in total.items() 
+            # Only update word weights for new words. This does mean
+            # that weight estimates for common words will be based on 
+            # less information than estimates for rare words. But these
+            # values have to be constant; this compromise allows an
+            # online implementation.
+            to_update = [ix for ix, ct in batch_word_count.items() 
                          if self._word_weight[ix] <= 0]
 
-            # TODO: vectorize this where possible
+            units = (1 for ix in to_update)
+            probs = (self._word_count[ix] / word_count_total 
+                     for ix in to_update)
+            slens = (len(wordnet.synsets(self.words[ix]))
+                     for ix in to_update)
             if self.ambiguity_vector in ('', '1', 'one'):
-                for ix in to_update:
-                    self._word_weight[ix] = 1
+                values = list(units)
             elif self.ambiguity_vector == 'scalefree':
-                for ix in to_update:
-                    self._word_weight[ix] = \
-                        numpy.exp(self._word_count[ix] / word_count_total -
-                                  sq_word_prob_sum)
-            else:
-                if self.ambiguity_vector == 'log':
-                    values = [numpy.log10(self._word_count[ix]) * self.ambiguity_scale + 1
-                              for ix in to_update]
-                elif self.ambiguity_vector == 'wordnet':
-                    synset_lens = (len(wordnet.synsets(self.words[ix]))
-                                   for ix in to_update)
-                    values = [numpy.log10(syn_len + 1) *
-                              self.ambiguity_scale + 1
-                              for syn_len in synset_lens]
+                values = [numpy.exp(p - sq_word_prob_sum)
+                          for p in probs]
+            elif self.ambiguity_vector == 'log':
+                values = [max(1, numpy.log10(p * 1e6) * self.ambiguity_scale)
+                          for p in probs]
+            elif self.ambiguity_vector == 'wordnet':
+                values = [numpy.log(synset_len + 1) * 
+                          self.ambiguity_scale + 1 
+                          for synset_len in slens]
+            elif self.ambiguity_vector == 'wordnetds':
+                downs = (min((self.downsample_threshold / p) ** 0.1, 1)
+                         for p in probs)
+                values = [(numpy.log10(synset_len + 1) * 
+                           self.ambiguity_scale + 1) * d
+                          for synset_len, d in zip(slens, downs)]
                 
-                self._word_weight.array[to_update] = values
+            self._word_weight.array[to_update] = values
 
             indices, counts = zip(*[i_c
                                     for doc in document_counts
@@ -289,12 +296,12 @@ class DocArray(abc.Sequence):
             counts = numpy.array(counts, dtype=float)
             ends = numpy.cumsum([len(doc) for doc in document_counts])
 
-            if self.downsample_threshold < 1.0:
+            if self.downsample_threshold < 1.0 and self.ambiguity_vector != 'wordnetds':
                 threshold = self.downsample_threshold
                 down_by_p = {
-                    word_i: 1 - (batch_total * threshold / total[word_i]) ** 0.5
+                    word_i: 1 - (batch_total * threshold / batch_word_count[word_i]) ** 0.5
                     for word_i, w in enumerate(self.words[:self.max_vocab])
-                    if (total[word_i] / batch_total) > threshold
+                    if (batch_word_count[word_i] / batch_total) > threshold
                 }
                 print('  Number of word types to be downsampled: ', len(down_by_p))
 
