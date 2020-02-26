@@ -51,7 +51,7 @@ def random_window_gen(mean, std, block_size=1000):
     if std == 0:
         while True:
             yield mean
-    else: 
+    else:
         while True:
             for v in numpy.random.normal(mean, std, block_size):
                 yield int(v)
@@ -93,6 +93,7 @@ def load_and_annotate_windows(txt, window_size=15):
     return annotated
 
 def load(fn, window_size=15, window_sigma=0.5):
+    txt = None
     if fn.endswith('.zip'):
         with ZipFile(fn) as ipz:
             names = ipz.namelist()
@@ -102,7 +103,9 @@ def load(fn, window_size=15, window_sigma=0.5):
     else:
         with open(fn) as ip:
             txt = ip.read()
-
+    if txt == None:
+        raise RuntimeError('File {} contained no files with '
+                           '.txt extension'.format(fn))
     return load_and_make_random_windows(txt, window_size, window_sigma)
 
 def group(it, n):
@@ -130,41 +133,44 @@ def sparsify_rows(matrix, iters=1):
 
     return matrix
 
-# This is my quick-and-dirty implementation of what Ben Schmidt calls
-# "Stable Random Projection." I'm not sure it's totally correct, but
-# the idea is from him.
-def srp_matrix_old(words, dimension, _hashfunc=city_64(0)):
-    multiplier = (dimension - 1) // 64 + 1
-    hashes = [
-        list(map(_hashfunc, ['{}_{}'.format(w, i) for i in range(multiplier)]))
-        for w in words
-    ]
+def srp_matrix_hasher(binary=True, seed=0):
+    if binary:
+        # This is my quick-and-dirty implementation of what Ben Schmidt calls
+        # "Stable Random Projection." I'm not sure it's totally correct, but
+        # the idea is from him.
+        def srp_matrix(words, dimension, _hashfunc=city_64(seed)):
+            multiplier = (dimension - 1) // 64 + 1
+            hashes = [
+                list(map(_hashfunc, ['{}_{}'.format(w, i) for i in range(multiplier)]))
+                for w in words
+            ]
 
-    # Given a `multipier` value of 5, `hashes` is really a Vx5
-    # array of 8-byte integers, where V is the vocabulary size.
+            # Given a `multipier` value of 5, `hashes` is really a Vx5
+            # array of 8-byte integers, where V is the vocabulary size.
 
-    hash_arr = numpy.array(hashes, dtype=numpy.int64)
+            hash_arr = numpy.array(hashes, dtype=numpy.int64)
 
-    # But we could also think of it as an array of bytes,
-    # where every word is represented by 40 bytes...
+            # But we could also think of it as an array of bytes,
+            # where every word is represented by 40 bytes...
 
-    hash_arr = hash_arr.view(dtype=numpy.uint8)
+            hash_arr = hash_arr.view(dtype=numpy.uint8)
 
-    # ...or even as an array of bits, where every word is represented
-    # by 320 bits...
+            # ...or even as an array of bits, where every word is represented
+            # by 320 bits...
 
-    hash_arr = numpy.unpackbits(hash_arr.ravel()).reshape(-1, 64 * multiplier)
-    out = hash_arr.astype(numpy.float64) * 2 - 1
-    return out[:, :dimension]
+            hash_arr = numpy.unpackbits(hash_arr.ravel()).reshape(-1, 64 * multiplier)
+            out = hash_arr.astype(numpy.float64) * 2 - 1
+            return out[:, :dimension]
+    else:
+        def srp_matrix(words, dimension, _hashfunc=city_64(seed)):
+            seeds = [_hashfunc(w) & (2 ** 32 - 1) for w in words]
+            out = []
+            for s in seeds:
+                numpy.random.seed(s)
+                out.append(numpy.random.normal(0.0, 1 / 3, size=dimension))
 
-def srp_matrix(words, dimension, _hashfunc=city_64(0)):
-    seeds = [_hashfunc(w) & (2 ** 32 - 1) for w in words]
-    out = []
-    for s in seeds:
-        numpy.random.seed(s)
-        out.append(numpy.random.normal(0.0, 1 / 3, size=dimension))
-
-    return numpy.array(out)
+            return numpy.array(out)
+    return srp_matrix
 
 def resample_vectors(vecs):
     new_vecs = numpy.empty(vecs.shape, dtype=vecs.dtype)

@@ -72,9 +72,10 @@ class ExtendWrap(abc.Sequence):
         self._len = new_len
 
 class DocArray(abc.Sequence):
-    def __init__(self, documents=None, ambiguity_vector='', 
+    def __init__(self, documents=None, ambiguity_vector='',
                  ambiguity_scale=1.0 / 3, ambiguity_base=1.0,
-                 hash_dimension=300, max_vocab=500000,
+                 hash_dimension=300, hash_seed=0,
+                 hash_distribution='binary', max_vocab=500000, 
                  downsample_threshold=1.0):
         self.ambiguity_vector = ambiguity_vector
         self.ambiguity_scale = ambiguity_scale
@@ -82,6 +83,10 @@ class DocArray(abc.Sequence):
         self.hash_dimension = hash_dimension
         self.max_vocab = max_vocab
         self.downsample_threshold = downsample_threshold
+        self.srp_matrix = util.srp_matrix_hasher(
+                hash_distribution == 'binary', 
+                hash_seed
+                )
         self._hash_vectors = None
 
         if isinstance(documents, DocArray):
@@ -153,7 +158,7 @@ class DocArray(abc.Sequence):
     @property
     def hash_vectors(self):
         if self._hash_vectors is None:
-            self._hash_vectors = util.srp_matrix(self.words[:self.max_vocab],
+            self._hash_vectors = self.srp_matrix(self.words[:self.max_vocab],
                                                  self.hash_dimension)
         return self._hash_vectors
 
@@ -281,13 +286,11 @@ class DocArray(abc.Sequence):
                 values = [numpy.log(synset_len + 1) * 
                           self.ambiguity_scale + 1 
                           for synset_len in slens]
-            elif self.ambiguity_vector == 'wordnetds':
-                downs = (min((self.downsample_threshold / p) ** 0.1, 1)
-                         for p in probs)
-                values = [(numpy.log10(synset_len + 1) * 
-                           self.ambiguity_scale + 1) * d
-                          for synset_len, d in zip(slens, downs)]
-                
+            elif self.ambiguity_vector == 'wordnetlog10':
+                values = [numpy.log10(synset_len + 1) * 
+                          self.ambiguity_scale + 1 
+                          for synset_len in slens]
+               
             self._word_weight.array[to_update] = values
 
             indices, counts = zip(*[i_c
@@ -296,7 +299,7 @@ class DocArray(abc.Sequence):
             counts = numpy.array(counts, dtype=float)
             ends = numpy.cumsum([len(doc) for doc in document_counts])
 
-            if self.downsample_threshold < 1.0 and self.ambiguity_vector != 'wordnetds':
+            if self.downsample_threshold < 1.0:
                 threshold = self.downsample_threshold
                 down_by_p = {
                     word_i: 1 - (batch_total * threshold / batch_word_count[word_i]) ** 0.5

@@ -41,13 +41,20 @@ def parse_args():
         'values from {-1, 1} are chosen according to a balanced binary '
         'distribution. In `gaussian` mode values are sampled from a normal '
         'distribution with a mean of 0 and a standard deviation of 1/3 '
-        '(giving ~99% of all values in the range of (-1, 1).'
+        '(giving ~99%% of all values in the range of (-1, 1).'
+    )
+    parser.add_argument(
+        '--projection-seed',
+        default=0,
+        type=int,
+        help='Seed for the random projection hash function. Defaults to 0 to '
+        'give consistent results across runs (with the same settings).'
     )
     parser.add_argument(
         '-v',
         '--ambiguity-vector',
         default='1',
-        choices=['1', 'log', 'scalefree', 'wordnet', 'wordnetds'],
+        choices=['1', 'log', 'scalefree', 'wordnet', 'wordnetlog10'],
         type=str,
         help='Method for selecting a point in ambiguity space for evaluating '
         'the jacobian and hessian. Defaults to the one-point (1, 1, 1, ...). '
@@ -77,8 +84,7 @@ def parse_args():
         'For a typical English-language corpus, this tends to reduce '
         'the frequency of roughly the top 10 / t '
         'words. For example, a threshold of 1e-4 will downsample '
-        'about 1000 words. In wordnetds mode, this is appplied to '
-        'the ambiguity vector instead of to the raw word frequencies.'
+        'about 1000 words.'
     )
     parser.add_argument(
         '-C',
@@ -213,6 +219,8 @@ def main(args):
                     ambiguity_scale=args.ambiguity_scale,
                     ambiguity_base=args.ambiguity_base,
                     hash_dimension=args.dimension,
+                    hash_distribution=args.projection_distribution,
+                    hash_seed=args.projection_seed,
                     max_vocab=args.max_vocab,
                     downsample_threshold=args.downsample_threshold)
     emb = Embedding(docs, verbose=args.verbose)

@@ -46,7 +46,7 @@ def evaluate_vectors(W, vocab, ivocab):
 
     # to avoid memory overflow, could be increased/decreased
     # depending on system and vocab size
-    split_size = 100
+    split_size = 1000
 
     correct_sem = 0; # count correct semantic questions
     correct_syn = 0; # count correct syntactic questions
@@ -73,16 +73,16 @@ def evaluate_vectors(W, vocab, ivocab):
             a  = W[ind1[subset], :]
             a_ = W[ind2[subset], :]
             b  = W[ind3[subset], :]
-            pred_vec = a_ - a + b
             
             # Cosine similarity if input W has been normalized
+            pred_vec = a_ - a + b
             dist = np.dot(W, pred_vec.T)
 
-            # The above is equivalent but more efficient than this:
+            # The above is equivalent to but more efficient than this:
             # dist = np.dot(W, a_.T) + np.dot(W, b.T) - np.dot(W, a.T)
 
             # To use 3CosMul as descried in Levy, Goldberg, Dagan (2016):
-            # dist = (np.dot(W, a_.T) + np.dot(W, b.T)) / (np.dot(W, a.T) + 1e-10)
+            # dist = (np.dot(W, a_.T) + np.dot(W, b.T)) / (np.dot(W, a.T) + 1e-3)
 
             for k in range(len(subset)):
                 dist[ind1[subset[k]], k] = -np.Inf
@@ -92,7 +92,7 @@ def evaluate_vectors(W, vocab, ivocab):
             # predicted word index
             predictions[subset] = np.argmax(dist, 0).flatten()
 
-        val = (ind4 == predictions) # top 3 predictions
+        val = (ind4 == predictions) # top 1 prediction
         count_tot = count_tot + len(ind1)
         correct_tot = correct_tot + sum(val)
         if i < 5:
@@ -105,6 +105,11 @@ def evaluate_vectors(W, vocab, ivocab):
         print("%s:" % filenames[i])
         print('ACCURACY TOP1: %.2f%% (%d/%d)' %
             (np.mean(val) * 100, np.sum(val), len(val)))
+
+        for analogy, p, v in zip(data, predictions, val):
+            if not v and np.random.random() > 0.99:
+                a, a_, b, b_ = analogy
+                print(f'{a_} - {a} + {b} = {b_} -- incorrect answer: ', ivocab[p])
 
     print('Questions seen/total: %.2f%% (%d/%d)' %
         (100 * count_tot / float(full_count), count_tot, full_count))
