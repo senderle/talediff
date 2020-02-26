@@ -148,7 +148,7 @@ def srp_matrix_hasher(binary=True, seed=0):
             # Given a `multipier` value of 5, `hashes` is really a Vx5
             # array of 8-byte integers, where V is the vocabulary size.
 
-            hash_arr = numpy.array(hashes, dtype=numpy.int64)
+            hash_arr = numpy.array(hashes, dtype=numpy.uint64)
 
             # But we could also think of it as an array of bytes,
             # where every word is represented by 40 bytes...
