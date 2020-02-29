@@ -75,7 +75,7 @@ class DocArray(abc.Sequence):
     def __init__(self, documents=None, ambiguity_vector='',
                  ambiguity_scale=1.0 / 3, ambiguity_base=1.0,
                  hash_dimension=300, hash_seed=0,
-                 hash_distribution='binary', max_vocab=500000, 
+                 hash_distribution='binary', max_vocab=500000,
                  downsample_threshold=1.0):
         self.ambiguity_vector = ambiguity_vector
         self.ambiguity_scale = ambiguity_scale
@@ -84,21 +84,65 @@ class DocArray(abc.Sequence):
         self.max_vocab = max_vocab
         self.downsample_threshold = downsample_threshold
         self.srp_matrix = util.srp_matrix_hasher(
-                hash_distribution == 'binary', 
+                hash_distribution == 'binary',
                 hash_seed
                 )
         self._hash_vectors = None
 
         if isinstance(documents, DocArray):
             # Should we inherit settings from the DocArray passed in here??
+
+            #### The DocArray data structure involves a lot of indirection.
+            #### This attempts to document it, at least minimally. It's
+            #### worth noting that this approach could probably be
+            #### simplified a great deal now that I know what I'm doing.
+
+            ### Vocabulary information:
+
+            ## This is basically just a table of information about
+            ## word types. Almost all of these are V items long, 
+            ## where V is the vocabulary size. 
+
+            # A list of all the word types in the corpus (so far).
             self.words = list(documents.words)
+
+            # An index mapping word types to their position in the above.
             self.word_index = dict(documents.word_index)
+
+            # The cumulative token count for each word type. V items.
             self._word_count = ExtendWrap(documents._word_count)
+
+            # The cumulative token count for the entire corpus (so far).
+            # This is the only scalar here.
             self._word_count_total = documents._word_count.array.sum()
+
+            # The weight given to each word type. In the model, this is
+            # the ambiguity value associated with each word type.
             self._word_weight = ExtendWrap(documents._word_weight)
+
+            ### Document information:
+
+            ## This is a ragged array containing information about 
+            ## each document, represented as a bag of words. That is,
+            ## we store word counts for word types, but no order.
+            ## This saves a modest amoung of memory, but forces
+            ## us into a BOW model, unfortunately, which I now
+            ## regard as a design error.
+
+            # An array storing the endpoints of a ragged array of documents.
+            # Its length is equal to D, the number of documents seen.
+            # In effect, this chops up self._indices and self._counts below
+            # into irregular chunks.
             self._ends = ExtendWrap(documents._ends)
+
+            # The indices (in `words`) of each word type in the document.
+            # Its length is equal to `max(self._ends)`.
             self._indices = ExtendWrap(documents._indices)
+
+            # The number of times the given word type occurs in the document.
+            # Its length is equal to `max(self._ends)`. 
             self._counts = ExtendWrap(documents._counts)
+
         else:
             self.empty_index()
 
@@ -113,6 +157,10 @@ class DocArray(abc.Sequence):
 
     def __getitem__(self, index):
         if isinstance(index, slice):
+            # This implements slicing, passing through the indireciton
+            # of the data struture and allowing us to treat it as if it
+            # were an ordinary list. Single-item indexing is easier to
+            # grok at first; see comments below the `else` clause.
             if index.stop > len(self):
                 index = slice(index.start, len(self), index.step)
             ends = self._ends[index]
@@ -138,6 +186,12 @@ class DocArray(abc.Sequence):
             new._counts.extend(self._counts[new_index])
             return new
         else:
+            # This passes through the indirection of the data structure,
+            # allowing us to treat it as if it were an ordinary array
+            # of documents. We slice out the word type indices and 
+            # the document token counts for the types. Then we use
+            # the indices to look up word type-level information:
+            # the total word count over the corpus and the weight.
             start = 0 if index == 0 else self._ends[index - 1]
             end = self._ends[index]
             return (self._indices[start:end],
@@ -231,6 +285,12 @@ class DocArray(abc.Sequence):
                 self.word_index[w] = self.max_vocab - 1
 
     def extend_iter(self, doc_iter, chunksize=10000):
+        # This is a fairly awkward way of getting the data from one
+        # `DocArray` into another, but it is necessary because two 
+        # `DocArray`s almost certainly won't have the same index
+        # structure. Reindexing probably wouldn't be any faster
+        # than converting the `DocArray` back into "text", so
+        # that's what we do here.
         if isinstance(doc_iter, DocArray):
             doc_iter = doc_iter.iter_as_documents()
 
@@ -262,35 +322,50 @@ class DocArray(abc.Sequence):
                 self._word_count[ix] += ct
 
             # Only update word weights for new words. This does mean
-            # that weight estimates for common words will be based on 
+            # that weight estimates for common words will be based on
             # less information than estimates for rare words. But these
             # values have to be constant; this compromise allows an
             # online implementation.
-            to_update = [ix for ix, ct in batch_word_count.items() 
+            to_update = [ix for ix, ct in batch_word_count.items()
                          if self._word_weight[ix] <= 0]
 
             units = (1 for ix in to_update)
-            probs = (self._word_count[ix] / word_count_total 
+            probs = (self._word_count[ix] / word_count_total
                      for ix in to_update)
             slens = (len(wordnet.synsets(self.words[ix]))
                      for ix in to_update)
+
+            # Every word has just one meaning!
             if self.ambiguity_vector in ('', '1', 'one'):
                 values = list(units)
+
+            # Common words have more ambiguity than rare ones,
+            # but in such a way that sentences will have the
+            # same ambiguity, on average.
             elif self.ambiguity_vector == 'scalefree':
                 values = [numpy.exp(p - sq_word_prob_sum)
                           for p in probs]
+
+            # Common words have more ambiguity than rare ones, 
+            # according to a scaled log10 curve.
             elif self.ambiguity_vector == 'log':
                 values = [max(1, numpy.log10(p * 1e6) * self.ambiguity_scale)
                           for p in probs]
+
+            # Word ambiguity is approximately the logarithm of the number 
+            # of meanings listed for the word in wordnet.
             elif self.ambiguity_vector == 'wordnet':
-                values = [numpy.log(synset_len + 1) * 
-                          self.ambiguity_scale + 1 
+                values = [numpy.log(synset_len + 1) *
+                          self.ambiguity_scale + 1
                           for synset_len in slens]
+
+            # Word ambiguity is approximately the base 10 logarithm of the 
+            # number of meanings listed for the word in wordnet.
             elif self.ambiguity_vector == 'wordnetlog10':
-                values = [numpy.log10(synset_len + 1) * 
-                          self.ambiguity_scale + 1 
+                values = [numpy.log10(synset_len + 1) *
+                          self.ambiguity_scale + 1
                           for synset_len in slens]
-               
+
             self._word_weight.array[to_update] = values
 
             indices, counts = zip(*[i_c
@@ -299,6 +374,8 @@ class DocArray(abc.Sequence):
             counts = numpy.array(counts, dtype=float)
             ends = numpy.cumsum([len(doc) for doc in document_counts])
 
+            # Downsample common words; a standard technique in WEMs,
+            # used by word2vec, glove, and many, many others.
             if self.downsample_threshold < 1.0:
                 threshold = self.downsample_threshold
                 down_by_p = {
@@ -308,7 +385,7 @@ class DocArray(abc.Sequence):
                 }
                 print('  Number of word types to be downsampled: ', len(down_by_p))
 
-                to_downsample = ((doc_i,) * int(counts[doc_i]) for doc_i in range(len(indices)) 
+                to_downsample = ((doc_i,) * int(counts[doc_i]) for doc_i in range(len(indices))
                                  if indices[doc_i] in down_by_p)
 
                 to_downsample = numpy.array([doc_i for doc_i_set in to_downsample for doc_i in doc_i_set])
@@ -323,6 +400,7 @@ class DocArray(abc.Sequence):
             self._indices.extend(indices)
             self._counts.extend(counts)
 
+            # Some simple descriptive stats.
             ww_rav = self._word_weight.array.ravel()
             ww_max = ww_rav.max()
             ww_min = ww_rav.min()
@@ -334,6 +412,11 @@ class DocArray(abc.Sequence):
     def overwrite(self, documents):
         self.empty_docs()
         self.extend(documents)
+
+### This is dated; my thinking about this model has evolved
+### considerably. However, this might be interesting as a 
+### document showing the original intuitions behind the 
+### model, so I'm leaving it for now.
 
 # OK: This word embedding model starts from the assumption that
 # words are types, and that individual instances of words --
@@ -449,19 +532,11 @@ class DocArray(abc.Sequence):
 # If we were to simply iterate the vectors
 # this way, normalizing dimensions by length, we'd
 # get straight-up power iteration, and, hence, the
-# first step of SVD. We want to avoid having all the
-# vectors collapse towards the single largest
-# eigenvector, though. One way to avoid that is to
-# take the newly calculated embedding vectors and
-# sparsify them so that they "look like" the original
-# binary projection vectors.
+# first step of something like the fast randomized
+# SVD algorithm described here:
+# 
+# https://research.fb.com/blog/2014/09/fast-randomized-svd/
 
-# But in the end, the most effective approach might
-# be to be to perform SVD over a small set of random
-# projection vectors. I was doing this and it was
-# working! But then it stopped working... and I
-# cannot for the life of me figure out what I
-# changed.
 
 # For multiprocessing, the following functions must
 # be in the global namespace of this module.
@@ -475,6 +550,7 @@ def train_chunk_multi(slice):
     if err_count > 0:
         print()
         print("Number of NAN values returned:", err_count)
+
 
 class Embedding(object):
     def __init__(self, docarray=None, verbose=False):
@@ -564,112 +640,10 @@ class Embedding(object):
         return [self.embed_vectors[self.docarray.word_index[w]]
                 for w in words]
 
-    def get_dist_func(self, word, euclidean=False):
-        word_vec = word
-        if isinstance(word, str):
-            word_vec = self.get_vec(word)
-
-        if euclidean:
-            def dist(w):
-                return util.euclidean_dist(self.get_vec(w), word_vec)
-        else:
-            def dist(w):
-                return 1 - util.cosine_sim(self.get_vec(w), word_vec)
-
-        return dist
-
-    def closest_words(self, word, n_words, euclidean=False, mincount=1):
-        return sorted(
-            [w for w in self.docarray.words
-             if self.docarray.str_count(w) >= mincount],
-            key=self.get_dist_func(word, euclidean)
-        )[:n_words]
-
-    def analogy(self, positive, negative, n_words, euclidean=False, mincount=1):
-        vec = numpy.add.reduce([self.get_vec(w) for w in positive])
-        vec -= numpy.add.reduce([self.get_vec(w) for w in negative])
-        return self.closest_words(vec, n_words, euclidean, mincount)
-
-    def interpret_dimension(self, dim, n_words, euclidean=False, mincount=1):
-        vec = numpy.zeros(self.embed_vectors.shape[1])
-        vec[dim] = 1
-        return self.closest_words(vec, n_words, euclidean, mincount)
-
-    def _svd_prep(self, U, s):
-        return U[:, :len(s)], numpy.diag(s)
-
-    def _svd_test(self, test_matrix):
-        U, s, V = numpy.linalg.svd(test_matrix)
-        U_, s_ = self._svd_prep(U, s)
-
-        # Sanity checks...
-
-        # Does U @ s @ V reconstruct the data?
-        assert numpy.allclose(U_ @ s_ @ V, test_matrix, atol=1e-05)
-
-        # Does X @ V.T == U @ s?
-        assert numpy.allclose(U_ @ s_, test_matrix @ V.T)
-
-        return U, s, V
-
-    def _svd_sq_test(self, raw_matrix, full_test=False):
-        if full_test:
-            mean = raw_matrix.mean(axis=0)
-            std = raw_matrix.std(axis=0)
-
-            matrix = raw_matrix - mean
-            matrix /= std
-        else:
-            matrix = raw_matrix
-
-        U_sq, s_sq, V_sq = self._svd_test(matrix.T @ matrix)
-        result = matrix @ V_sq.T
-
-        mean = matrix.mean(axis=0)
-        std = matrix.std(axis=0)
-        neg = matrix < 0
-        print(matrix[neg].ravel().sum())
-        print((mean * mean).sum() ** 0.5)
-        print((std * std).sum() ** 0.5)
-
-        if full_test:
-            U, s, V = self._svd_test(matrix)
-            assert numpy.allclose(s * s, s_sq, atol=1e-05)
-
-            U, s = self._svd_prep(U, s)
-            assert numpy.allclose(numpy.abs(U @ s),
-                                  numpy.abs(result))
-
-        return result, s_sq
-
-    def _eigen_embedding(self):
-        ev = self.embed_vectors
-        ev = ev * ((ev * ev).sum(axis=1) ** 0.5)  # Cosine distance norm
-        sample = numpy.random.choice(len(ev), size=ev.shape[1] * 20)
-        ev_sample = (ev[sample])
-
-        # Thorough test on a subsample
-        result, s = self._svd_sq_test(ev_sample)
-
-        # If the above test passes, then we can pass the full set of
-        # embedding vectors, and skip the full test, which will run
-        # out of memory on the full set.
-        result, s = self._svd_sq_test(ev, full_test=False)
-
-        print('  -- SVD --')
-        print('Shape of embedding vectors:')
-        print('{} rows, {} columns'.format(*ev.shape))
-        print('First 10 values of s:')
-        print(s[:10])
-        print('Last 10 values of s:')
-        print(s[-10:])
-
-        return result, s
-
     def _chunkparams(self, embed_shape):
         # Eventually, try to guess how much memory is available and try
         # to balance chunksize and n_procs against avialable memory.
-        
+
         mem_gigs_avail = psutil.virtual_memory().available
         n_words, n_dims = embed_shape
         min_chunksize = 1000
@@ -758,7 +732,7 @@ class Embedding(object):
             print(f'      embed avg: {ev_avg:.4g}')
 
         embed_vectors = self.embed_vectors / fout
-        
+
         if self.verbose:
             ev_rav = embed_vectors.ravel()
             ev_max = ev_rav.max()
@@ -822,7 +796,7 @@ class Embedding(object):
         else:
             with self.embed_vectors_accumulated_buffer.get_lock():
                 self.embed_vectors_accumulated[:] = embed_vectors
-        
+
         if not self.verbose:
             print(f'    Fout for this batch: {fout}')
             print( '    Final embedding stats:')
@@ -872,5 +846,3 @@ class Embedding(object):
         with open(filename, 'w', encoding='utf-8') as op:
             for r in rows:
                 op.write(r)
-
-
