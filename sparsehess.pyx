@@ -184,7 +184,6 @@ cdef long cy_train_chunk_vanilla_full(
     cdef double jac_i = 0
     cdef double jac_i_norm = 0
     cdef double counts_i = 0
-    cdef double totals_i = 0
     cdef double weights_i = 0
     cdef double hess_i_j = 0
     cdef double embed_dot = 0
@@ -221,7 +220,6 @@ cdef long cy_train_chunk_vanilla_full(
         for i in range(hess_size):
             w_i = indices[start + i]
             counts_i = counts[start + i]
-            totals_i = totals[start + i]
             weights_i = weights[start + i]
 
             # Calculate the value of the jacobian by dividing out the
@@ -284,7 +282,6 @@ cdef void cy_train_chunk_exponential_full(
     cdef double jac_i = 0
     cdef double jac_i_norm = 0
     cdef double counts_i = 0
-    cdef double totals_i = 0
     cdef double weights_i = 0
     cdef double hess_i_j = 0
     cdef double embed_dot = 0
@@ -320,7 +317,6 @@ cdef void cy_train_chunk_exponential_full(
         for i in range(hess_size):
             w_i = indices[start + i]
             counts_i = counts[start + i]
-            totals_i = totals[start + i]
             weights_i = weights[start + i]
 
             # Calculate the value of the jacobian by dividing out the
