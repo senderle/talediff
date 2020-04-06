@@ -2,13 +2,13 @@ import numba
 import numpy
 import timeit
 
-from time import sleep
-from math import log, exp
+from math import exp
+
 
 _return_type=numba.types.Tuple((numba.float64,
                                 numba.float64[:],
                                 numba.float64[:, :]))
-@numba.jit(_return_type(numba.float64[:], numba.float64[:]), 
+@numba.jit(_return_type(numba.float64[:], numba.float64[:]),
            nopython=True,
            nogil=True)
 def simple_hessian(ps, xs):
@@ -25,10 +25,11 @@ def simple_hessian(ps, xs):
 
     return f_out, jac, hess
 
+
 _return_type=numba.types.Tuple((numba.float64,
                                 numba.float64[:],
                                 numba.float64[:, :]))
-@numba.jit(_return_type(numba.float64[:], numba.float64[:]), 
+@numba.jit(_return_type(numba.float64[:], numba.float64[:]),
            nopython=True,
            nogil=True)
 def simple_log_hessian(ps, xs):
@@ -46,6 +47,7 @@ def simple_log_hessian(ps, xs):
             hess[i, j] = exp(jac[i] - log_xs[j]) * ps_j
 
     return exp(f_out), numpy.exp(jac), hess
+
 
 @numba.jit(numba.void(numba.float64[:],
                       numba.float64[:, :],
@@ -76,6 +78,7 @@ def simple_hessian_multi(f_out,
         jacobian_out[doc_ix] = jac
         hessian_out[doc_ix] = hess
 
+
 def _hessian_test_wrapper_multi(PS, XS):
     n_docs, n_dims = PS.shape
     f_out = numpy.zeros((n_docs,), dtype=numpy.float64)
@@ -84,8 +87,10 @@ def _hessian_test_wrapper_multi(PS, XS):
     ends = numpy.arange(0, n_dims * n_docs, n_dims) + n_dims
     counts = numpy.array(PS.ravel(), dtype=numpy.float64)
     weights = numpy.array(XS.ravel(), dtype=numpy.float64)
-    simple_hessian_multi(f_out, jacobian_out, hessian_out, ends, counts, weights)
+    simple_hessian_multi(f_out, jacobian_out, hessian_out,
+                         ends, counts, weights)
     return hessian_out[0]
+
 
 def _estimated_hessian(ps, xs, delta=1e-4):
     def poly_eval(ps, xs):
@@ -135,14 +140,15 @@ def _estimated_hessian(ps, xs, delta=1e-4):
                 result[i, j] = est_at(i, j)
     return result
 
+
 def _test_hessian_speed():
     setup = """
 from sparsehessnumba import (  # This module!
-    simple_hessian, 
+    simple_hessian,
     simple_log_hessian,
     _hessian_test_wrapper_multi
 )
-import numpy 
+import numpy
 
 n_vars = 50
 n_tests = 100000
@@ -155,7 +161,7 @@ XS = numpy.random.random((n_tests, n_vars)) * 3
 for ps, xs in zip(PS, XS):
     {}(ps, xs)
     """
-    
+
     funcs = []  # ['simple_hessian', 'simple_log_hessian']
     print()
     print('Hessian function performance tests:')
@@ -172,6 +178,7 @@ _hessian_test_wrapper_multi(PS, XS)
 """
     timeit.main(['-s', setup, stmt])
 
+
 def _test_hessian_correctness():
     n_vars = 50
     n_tests = 100
@@ -181,7 +188,6 @@ def _test_hessian_correctness():
     delta = 1e-6
 
     failed = 0
-    est_failed = 0
     for ps, xs in zip(PS, XS):
         _f, _j, simple_hessian_result = simple_hessian(ps, xs)
         _f, _j, simple_log_hessian_result = simple_log_hessian(ps, xs)
@@ -243,6 +249,7 @@ def _test_hessian_correctness():
         print("than 0.001 for more than twenty or thirty tests.")
     else:
         print("All hessian tests passed.")
+
 
 if __name__ == '__main__':
     _test_hessian_correctness()
